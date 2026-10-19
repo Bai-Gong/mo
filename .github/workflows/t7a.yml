@@ -1,0 +1,10 @@
+name: T7a job if hashFiles
+on:
+  push:
+    branches: [develop]
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    if: hashFiles('package.json') != ''
+    steps:
+      - run: echo ok

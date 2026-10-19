@@ -1,0 +1,10 @@
+name: T7c plain quotes
+on:
+  push:
+    branches: [develop]
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - run: echo ok

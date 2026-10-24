@@ -28,3 +28,12 @@ zune-jpeg、PNG 编解码内置 png，内部工作格式 RGBA8，另存时 ICC �
 M1 完成多标签画布 / 缩放平移（1%–3200%）/ 吸管取色与像素信息；准入场景
 「打开 → 放大到像素级查看 → 另存」由 Rust 侧真实文件 roundtrip 测试
 （src-tauri/src/imageio.rs）与前端状态层测试（src/core/）共同锁定。
+
+M2 完成图层与选区：文档模型升级为图层栈（增删/排序/可见性/不透明度/
+混合模式——正常、正片叠底、滤色、叠加，合成公式取 W3C Compositing Level 1），
+矩形/椭圆/套索选区按浮点几何栅格化为抗锯齿蒙版并约束填充；像素事实源与
+合成在 Rust 侧（src-tauri/src/layers.rs、selection.rs），前端经 layerPipeline
+编排面板与画布（坊 DockHost 图层面板、选区工具 M/O/L、编辑菜单全选/取消/
+填充）。准入场景「多图层合成海报底稿并导出 PNG」由 Rust 侧端到端测试锁定
+（真实 new_document → 选区填充 → 多层混合 → PNG 导出 → 重新解码校验尺寸
+与关键像素，src-tauri/src/imageio.rs `m2_准入_多图层海报底稿_…`）。

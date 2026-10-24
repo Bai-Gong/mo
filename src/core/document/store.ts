@@ -1,14 +1,18 @@
 /**
- * 工程状态（M1）：打开的文档标签 + 每文档视口 + 工具/光标/取色会话态。
+ * 工程状态（M1 + M2）：打开的文档标签 + 每文档视口 + 图层/选区元信息
+ * + 工具/光标/取色会话态。
  *
  * 写入纪律（参照 jian store）：
  * - 像素本体不进 store（pixelStore 驻留），这里只放元信息与视口；
  * - 视口未适配用 null 占位：文档打开时画布可能尚未布局（viewportSize 未知），
  *   CanvasView 首帧量到尺寸后 ensureView 落「适合窗口」；
- * - 缩放一律经 coords.ts 的数学（钳制/锚点不变式），store 不自算。
+ * - 缩放一律经 coords.ts 的数学（钳制/锚点不变式），store 不自算；
+ * - M2 图层列表/活动层/选区回显/合成版本是「Rust 事实源的影子」，只由
+ *   layerPipeline 在命令成功后写入；合成像素重拉后 bump compositeVersion，
+ *   CanvasView 据版本号重建离屏源画布。
  */
 import { create } from "zustand";
-import type { ImageDocMeta, Tool, Viewport } from "./types";
+import type { ImageDocMeta, LayerMeta, Tool, Viewport } from "./types";
 import {
   actualSizeViewport,
   fitViewport,
@@ -16,6 +20,7 @@ import {
   zoomAround,
   type Size,
 } from "../canvas/coords";
+import type { SelectionShape } from "../canvas/selection";
 import { clampZoom } from "../canvas/fit";
 import type { Rgba } from "../canvas/pixelPicker";
 
@@ -29,6 +34,14 @@ export interface DocsState {
   activeId: number | null;
   /** docId → 视口；null = 尚未适配（待画布量到尺寸后 fit）。 */
   views: Record<number, Viewport | null>;
+  /** docId → 图层列表（自底向上，Rust LayersSnapshot 的影子）。 */
+  layers: Record<number, LayerMeta[]>;
+  /** docId → 活动图层 id（填充落点）。 */
+  activeLayerId: Record<number, number>;
+  /** docId → 选区形状回显（画蚂蚁线用；蒙版事实在 Rust 侧，null = 无选区）。 */
+  selection: Record<number, SelectionShape | null>;
+  /** docId → 合成版本号（像素重拉后 +1，画布源缓存失效依据）。 */
+  compositeVersion: Record<number, number>;
   tool: Tool;
   /** 光标所在图像像素坐标（图像外/无文档为 null）。 */
   cursor: { x: number; y: number } | null;
@@ -58,6 +71,12 @@ export interface DocsState {
   setCursor(point: { x: number; y: number } | null, hover: Rgba | null): void;
   pickColor(color: Rgba): void;
   setMessage(message: StatusMessage | null): void;
+  /** 图层快照落位（layerPipeline 在命令成功后调用）。 */
+  setLayers(docId: number, layers: LayerMeta[], activeLayerId: number): void;
+  /** 选区回显落位（null = 取消选择）。 */
+  setSelectionEcho(docId: number, shape: SelectionShape | null): void;
+  /** 合成像素已重拉，画布源缓存应失效。 */
+  bumpComposite(docId: number): void;
 }
 
 /** 派生：活动文档元信息。 */
@@ -70,10 +89,24 @@ export function selectActiveView(s: DocsState): Viewport | undefined {
   return s.activeId === null ? undefined : (s.views[s.activeId] ?? undefined);
 }
 
+/** 派生：活动文档的图层列表（自底向上）。 */
+export function selectActiveLayers(s: DocsState): LayerMeta[] {
+  return s.activeId === null ? [] : (s.layers[s.activeId] ?? []);
+}
+
+/** 派生：活动文档的选区回显。 */
+export function selectActiveSelection(s: DocsState): SelectionShape | null {
+  return s.activeId === null ? null : (s.selection[s.activeId] ?? null);
+}
+
 export const useDocsStore = create<DocsState>()((set, get) => ({
   docs: [],
   activeId: null,
   views: {},
+  layers: {},
+  activeLayerId: {},
+  selection: {},
+  compositeVersion: {},
   tool: "hand",
   cursor: null,
   hoverColor: null,
@@ -86,21 +119,37 @@ export const useDocsStore = create<DocsState>()((set, get) => ({
       docs: [...s.docs, meta],
       activeId: meta.id,
       views: { ...s.views, [meta.id]: null },
+      layers: { ...s.layers, [meta.id]: [] },
+      activeLayerId: { ...s.activeLayerId, [meta.id]: 0 },
+      selection: { ...s.selection, [meta.id]: null },
+      compositeVersion: { ...s.compositeVersion, [meta.id]: 0 },
     })),
 
   closeTab: (id) => {
-    const { docs, activeId, views } = get();
+    const { docs, activeId, views, layers, activeLayerId, selection, compositeVersion } = get();
     const index = docs.findIndex((d) => d.id === id);
     if (index < 0) return;
     const rest = docs.filter((d) => d.id !== id);
     const nextViews = { ...views };
     delete nextViews[id];
+    const nextLayers = { ...layers };
+    delete nextLayers[id];
+    const nextActiveLayer = { ...activeLayerId };
+    delete nextActiveLayer[id];
+    const nextSelection = { ...selection };
+    delete nextSelection[id];
+    const nextVersion = { ...compositeVersion };
+    delete nextVersion[id];
     // 关的是活动标签 → 让位左邻，无左邻取右邻；全关 → null
     const nextActive =
       activeId === id ? (rest[Math.max(0, index - 1)]?.id ?? null) : activeId;
     set({
       docs: rest,
       views: nextViews,
+      layers: nextLayers,
+      activeLayerId: nextActiveLayer,
+      selection: nextSelection,
+      compositeVersion: nextVersion,
       activeId: nextActive,
       cursor: activeId === id ? null : get().cursor,
     });
@@ -182,4 +231,21 @@ export const useDocsStore = create<DocsState>()((set, get) => ({
   pickColor: (color) => set({ pickedColor: color }),
 
   setMessage: (message) => set({ message }),
+
+  setLayers: (docId, layers, activeLayerId) =>
+    set((s) => ({
+      layers: { ...s.layers, [docId]: layers },
+      activeLayerId: { ...s.activeLayerId, [docId]: activeLayerId },
+    })),
+
+  setSelectionEcho: (docId, shape) =>
+    set((s) => ({ selection: { ...s.selection, [docId]: shape } })),
+
+  bumpComposite: (docId) =>
+    set((s) => ({
+      compositeVersion: {
+        ...s.compositeVersion,
+        [docId]: (s.compositeVersion[docId] ?? 0) + 1,
+      },
+    })),
 }));

@@ -32,6 +32,8 @@ body {
 .app-canvas-area {
   flex: 1;
   min-width: 0;
+  /* 坊 DockHost 中列为滚动容器（非 flex）：撑满其内容盒，画布列才能满高 */
+  height: 100%;
   display: flex;
   flex-direction: column;
 }
@@ -269,6 +271,149 @@ body {
   font-family: var(--fang-font-mono);
   font-size: var(--fang-font-size-xs);
   color: var(--fang-color-text);
+}
+
+/* —— 图层面板（M2 右停靠，坊 DockPanel 内容区） —— */
+
+.mo-layers {
+  display: flex;
+  flex-direction: column;
+  gap: var(--fang-space-2);
+  min-height: 0;
+  flex: 1;
+}
+
+.mo-layers__empty {
+  margin: 0;
+  font-size: var(--fang-font-size-sm);
+  color: var(--fang-color-text-muted);
+}
+
+.mo-layers__controls {
+  display: flex;
+  flex-direction: column;
+  gap: var(--fang-space-2);
+}
+
+.mo-layers__field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--fang-space-1);
+  font-size: var(--fang-font-size-xs);
+  color: var(--fang-color-text-secondary);
+}
+
+.mo-layers__field select {
+  padding: var(--fang-space-1);
+  border: 1px solid var(--fang-color-border-strong);
+  border-radius: var(--fang-radius-sm);
+  background: var(--fang-color-bg);
+  color: var(--fang-color-text);
+  font: var(--fang-font-size-sm)/1.4 var(--fang-font-family);
+}
+
+.mo-layers__field input[type="range"] {
+  width: 100%;
+  accent-color: var(--fang-color-accent);
+}
+
+.mo-layers__field em {
+  font-style: normal;
+  color: var(--fang-color-text);
+  font-family: var(--fang-font-mono);
+}
+
+.mo-layers__actions {
+  display: flex;
+  gap: var(--fang-space-1);
+}
+
+.mo-layers__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--fang-color-border);
+  border-radius: var(--fang-radius-sm);
+  background: var(--fang-color-bg-overlay);
+  color: var(--fang-color-text-secondary);
+  cursor: pointer;
+}
+
+.mo-layers__btn:hover:not(:disabled) {
+  background: var(--fang-color-hover);
+  color: var(--fang-color-text);
+}
+
+.mo-layers__btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.mo-layers__list {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--fang-space-1);
+  overflow-y: auto;
+}
+
+.mo-layers__row {
+  display: flex;
+  align-items: center;
+  gap: var(--fang-space-2);
+  width: 100%;
+  padding: var(--fang-space-1) var(--fang-space-2);
+  border: 1px solid var(--fang-color-border);
+  border-radius: var(--fang-radius-sm);
+  background: var(--fang-color-bg);
+  color: var(--fang-color-text-secondary);
+  cursor: pointer;
+  text-align: left;
+}
+
+.mo-layers__row:hover {
+  background: var(--fang-color-hover);
+  color: var(--fang-color-text);
+}
+
+.mo-layers__row--active,
+.mo-layers__row--active:hover {
+  background: var(--fang-color-selected);
+  border-color: var(--fang-color-accent);
+  color: var(--fang-color-text);
+}
+
+.mo-layers__eye {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fang-color-text-muted);
+}
+
+.mo-layers__row:hover .mo-layers__eye,
+.mo-layers__row--active .mo-layers__eye {
+  color: var(--fang-color-text);
+}
+
+.mo-layers__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fang-font-size-sm);
+}
+
+.mo-layers__meta {
+  font-size: var(--fang-font-size-xs);
+  color: var(--fang-color-text-muted);
+  white-space: nowrap;
 }
 
 /* —— 标题栏动作区（按钮 + 消息） —— */

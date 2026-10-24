@@ -7,6 +7,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   closeDoc,
+  createDocumentTab,
   fileNameOf,
   openImagePath,
   saveDocAs,
@@ -32,7 +33,7 @@ function payloadOf(docId: number, w: number, h: number): OpenedImagePayload {
 }
 
 interface Call {
-  kind: "open" | "save" | "close";
+  kind: "open" | "create" | "save" | "close";
   arg: unknown;
 }
 
@@ -45,6 +46,11 @@ function makeIo(): { io: ImageIo; calls: Call[] } {
       // 每个路径给一个稳定 docId（按调用序 1 起，模拟 Rust 注册表）
       const docId = calls.filter((c) => c.kind === "open").length;
       return payloadOf(docId, 4, 3);
+    },
+    async createDocument(input) {
+      calls.push({ kind: "create", arg: input });
+      const docId = calls.filter((c) => c.kind === "create").length + 100; // 与 open 序列错开
+      return payloadOf(docId, input.width, input.height);
     },
     async saveImageFile(input) {
       calls.push({ kind: "save", arg: input });
@@ -61,6 +67,10 @@ function resetAll() {
     docs: [],
     activeId: null,
     views: {},
+    layers: {},
+    activeLayerId: {},
+    selection: {},
+    compositeVersion: {},
     tool: "eyedropper",
     cursor: null,
     hoverColor: null,
@@ -135,6 +145,21 @@ describe("打开 → 查看（放大到像素级）→ 取色", () => {
     await expect(openImagePath("/x/坏文件.png", io)).rejects.toThrow("解码失败");
     expect(useDocsStore.getState().docs).toEqual([]);
     expect(getPixels(1)).toBeUndefined();
+  });
+});
+
+describe("新建文档（M2）", () => {
+  it("白底新建：标签、像素驻留、默认名按序编号", async () => {
+    const { io, calls } = makeIo();
+    const meta = await createDocumentTab({ width: 6, height: 4, background: [255, 255, 255, 255] }, io);
+    expect(meta.name).toBe("未命名-1.png");
+    expect(meta.width).toBe(6);
+    expect(useDocsStore.getState().activeId).toBe(meta.id);
+    expect(getPixels(meta.id)?.length).toBe(6 * 4 * 4);
+    expect(calls).toContainEqual({
+      kind: "create",
+      arg: { width: 6, height: 4, background: [255, 255, 255, 255] },
+    });
   });
 });
 

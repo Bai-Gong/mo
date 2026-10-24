@@ -22,6 +22,12 @@ export interface OpenedImagePayload {
 /** Rust 图像命令面的前端抽象（imageIo.ts 提供真实实现）。 */
 export interface ImageIo {
   openImageFile(path: string): Promise<OpenedImagePayload>;
+  /** M2 新建文档（背景层纯色或透明）。 */
+  createDocument(input: {
+    width: number;
+    height: number;
+    background: [number, number, number, number] | null;
+  }): Promise<OpenedImagePayload>;
   saveImageFile(input: {
     docId: number;
     path: string;
@@ -38,16 +44,11 @@ export function fileNameOf(path: string): string {
   return idx >= 0 ? norm.slice(idx + 1) : norm;
 }
 
-/** 打开一个文件为标签：像素驻留 + 元信息入 store + 激活。 */
-export async function openImagePath(
-  path: string,
-  io: ImageIo = tauriImageIo,
-): Promise<ImageDocMeta> {
-  const payload = await io.openImageFile(path);
+function openPayloadAsTab(payload: OpenedImagePayload, name: string, path: string): ImageDocMeta {
   setPixels(payload.docId, payload.pixels);
   const meta: ImageDocMeta = {
     id: payload.docId,
-    name: fileNameOf(path),
+    name,
     width: payload.width,
     height: payload.height,
     format: payload.format,
@@ -56,6 +57,25 @@ export async function openImagePath(
   };
   useDocsStore.getState().openTab(meta);
   return meta;
+}
+
+/** 打开一个文件为标签：像素驻留 + 元信息入 store + 激活。 */
+export async function openImagePath(
+  path: string,
+  io: ImageIo = tauriImageIo,
+): Promise<ImageDocMeta> {
+  const payload = await io.openImageFile(path);
+  return openPayloadAsTab(payload, fileNameOf(path), path);
+}
+
+/** 新建空白文档为标签（M2 海报/图层玩法起点）。标签名按打开序编号。 */
+export async function createDocumentTab(
+  input: { width: number; height: number; background: [number, number, number, number] | null },
+  io: ImageIo = tauriImageIo,
+): Promise<ImageDocMeta> {
+  const payload = await io.createDocument(input);
+  const seq = useDocsStore.getState().docs.length + 1;
+  return openPayloadAsTab(payload, `未命名-${seq}.png`, "");
 }
 
 /** 关闭标签并释放两端内存（前端像素 + Rust 驻留文档）。 */

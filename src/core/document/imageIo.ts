@@ -1,7 +1,8 @@
 /**
  * Rust 图像命令的真实 IPC 绑定（src-tauri/src/imageio.rs 的前端契约）。
- * - open_image → 元信息（camelCase，serde rename_all）；
- * - get_pixels → tauri::ipc::Response 原始字节通道，invoke 直接得 ArrayBuffer；
+ * - open_image / new_document_cmd → 元信息（camelCase，serde rename_all）；
+ * - get_pixels → tauri::ipc::Response 原始字节通道，invoke 直接得 ArrayBuffer
+ *   （M2 起返回图层栈合成结果）；
  * - save_document / close_document → 常规 JSON 命令。
  */
 import { invoke } from "@tauri-apps/api/core";
@@ -19,6 +20,20 @@ interface OpenImageInfo {
 export const tauriImageIo: ImageIo = {
   async openImageFile(path: string): Promise<OpenedImagePayload> {
     const info = await invoke<OpenImageInfo>("open_image", { path });
+    const buffer = await invoke<ArrayBuffer>("get_pixels", { docId: info.docId });
+    return { ...info, pixels: new Uint8ClampedArray(buffer) };
+  },
+
+  async createDocument(input: {
+    width: number;
+    height: number;
+    background: [number, number, number, number] | null;
+  }): Promise<OpenedImagePayload> {
+    const info = await invoke<OpenImageInfo>("new_document_cmd", {
+      width: input.width,
+      height: input.height,
+      background: input.background,
+    });
     const buffer = await invoke<ArrayBuffer>("get_pixels", { docId: info.docId });
     return { ...info, pixels: new Uint8ClampedArray(buffer) };
   },

@@ -1,23 +1,44 @@
 /**
- * 画布视口：单个活动文档的渲染与交互（M1 核心）。
+ * 画布视口：单个活动文档的渲染与交互（M1 核心 + M2 选区）。
  *
- * 渲染：RGBA8 像素一次性 putImageData 到离屏 canvas（按 doc 缓存），视口 canvas
- * 每帧 drawImage 缩放绘制——zoom≥1 关平滑（像素级检视见格点），zoom<1 开平滑。
- * 交互：滚轮以光标为锚缩放；抓手工具/按住空格/中键拖拽平移；吸管点击取色；
- * 光标移动实时回报图像坐标与悬停色（状态栏消费）。
+ * 渲染：合成像素（Rust get_pixels，M2 起为图层栈合成结果）putImageData 到离屏
+ * canvas（按 doc+compositeVersion 缓存），视口 canvas 每帧 drawImage 缩放绘制——
+ * zoom≥1 关平滑（像素级检视见格点），zoom<1 开平滑。选区（已提交 + 拖拽中）以
+ * 白实线+黑虚线双描显示。
+ * 交互：滚轮以光标为锚缩放；抓手/空格/中键平移；吸管取色；矩形/椭圆选框拖拽、
+ * 套索自由圈选（松手提交 Rust 栅格化；拖拽过小/不足 3 点按点击取消选区）。
  */
 import { useEffect, useRef, useState } from "react";
-import { useDocsStore, selectActiveDoc, selectActiveView } from "../../core/document/store";
+import {
+  useDocsStore,
+  selectActiveDoc,
+  selectActiveView,
+  selectActiveSelection,
+} from "../../core/document/store";
 import { getPixels } from "../../core/document/pixelStore";
 import { pickPixel } from "../../core/canvas/pixelPicker";
 import { insideImage, screenToImage } from "../../core/canvas/coords";
+import {
+  closeLasso,
+  ellipseFromDrag,
+  isTinyShape,
+  rectFromDrag,
+  type SelectionShape,
+} from "../../core/canvas/selection";
+import { commitSelection, deselect } from "../../core/document/layerPipeline";
+import type { Viewport } from "../../core/document/types";
 
-/** docId → 离屏源画布（putImageData 一次，缩放绘制走 drawImage）。 */
-const sources = new Map<number, HTMLCanvasElement>();
+/** docId → 离屏源画布 + 其合成版本（putImageData 一次，版本变才重建）。 */
+const sources = new Map<number, { version: number; canvas: HTMLCanvasElement }>();
 
-function sourceOf(id: number, width: number, height: number): HTMLCanvasElement | null {
+function sourceOf(
+  id: number,
+  version: number,
+  width: number,
+  height: number,
+): HTMLCanvasElement | null {
   const cached = sources.get(id);
-  if (cached) return cached;
+  if (cached && cached.version === version) return cached.canvas;
   const data = getPixels(id);
   if (!data) return null;
   const canvas = document.createElement("canvas");
@@ -30,7 +51,7 @@ function sourceOf(id: number, width: number, height: number): HTMLCanvasElement 
   const imageData = ctx.createImageData(width, height);
   imageData.data.set(data);
   ctx.putImageData(imageData, 0, 0);
-  sources.set(id, canvas);
+  sources.set(id, { version, canvas });
   return canvas;
 }
 
@@ -55,6 +76,51 @@ function getCheckerPattern(ctx: CanvasRenderingContext2D): CanvasPattern | null 
   return checkerPattern;
 }
 
+/** 图像坐标形状 → 屏幕坐标轮廓（白实线 + 黑虚线双描，静态蚂蚁线观感）。 */
+function strokeShape(
+  ctx: CanvasRenderingContext2D,
+  shape: SelectionShape,
+  view: Viewport,
+): void {
+  const toX = (x: number) => view.panX + x * view.zoom;
+  const toY = (y: number) => view.panY + y * view.zoom;
+  ctx.beginPath();
+  if (shape.kind === "rect") {
+    ctx.rect(toX(shape.x), toY(shape.y), shape.w * view.zoom, shape.h * view.zoom);
+  } else if (shape.kind === "ellipse") {
+    ctx.ellipse(
+      toX(shape.cx),
+      toY(shape.cy),
+      Math.max(shape.rx * view.zoom, 0.5),
+      Math.max(shape.ry * view.zoom, 0.5),
+      0,
+      0,
+      Math.PI * 2,
+    );
+  } else {
+    shape.points.forEach(([x, y], i) =>
+      i === 0 ? ctx.moveTo(toX(x), toY(y)) : ctx.lineTo(toX(x), toY(y)),
+    );
+    ctx.closePath();
+  }
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "rgba(255,255,255,0.9)";
+  ctx.setLineDash([]);
+  ctx.stroke();
+  ctx.strokeStyle = "rgba(0,0,0,0.9)";
+  ctx.setLineDash([4, 3]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+/** 选区拖拽会话（图像坐标）。marquee 为对角两点；lasso 为已采顶点列。 */
+interface MarqueeDraft {
+  ax: number;
+  ay: number;
+  bx: number;
+  by: number;
+}
+
 export function CanvasView() {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -62,6 +128,15 @@ export function CanvasView() {
   const view = useDocsStore(selectActiveView);
   const tool = useDocsStore((s) => s.tool);
   const viewportSize = useDocsStore((s) => s.viewportSize);
+  const compositeVersion = useDocsStore((s) =>
+    s.activeId === null ? 0 : (s.compositeVersion[s.activeId] ?? 0),
+  );
+  const selectionEcho = useDocsStore(selectActiveSelection);
+
+  // 选区工具的拖拽会话（图像坐标）
+  const [marqueeDraft, setMarqueeDraft] = useState<MarqueeDraft | null>(null);
+  const [lassoDraft, setLassoDraft] = useState<[number, number][] | null>(null);
+  const selecting = marqueeDraft !== null || lassoDraft !== null;
 
   // 按住空格 → 临时抓手（Photoshop 惯例）
   const [spaceHeld, setSpaceHeld] = useState(false);
@@ -132,7 +207,7 @@ export function CanvasView() {
       if (!liveIds.has(id)) sources.delete(id);
     }
 
-    const src = sourceOf(doc.id, doc.width, doc.height);
+    const src = sourceOf(doc.id, compositeVersion, doc.width, doc.height);
     if (!src) return;
     const sx = view.panX;
     const sy = view.panY;
@@ -153,7 +228,20 @@ export function CanvasView() {
     ctx.strokeStyle = getComputedStyle(container).getPropertyValue("--fang-color-border-strong").trim() || "#4a4e55";
     ctx.lineWidth = 1;
     ctx.strokeRect(sx - 0.5, sy - 0.5, sw + 1, sh + 1);
-  }, [doc, view, viewportSize]);
+
+    // 选区轮廓：已提交回显 + 拖拽中的预览
+    if (selectionEcho) strokeShape(ctx, selectionEcho, view);
+    if (marqueeDraft) {
+      const shape =
+        tool === "marquee-ellipse"
+          ? ellipseFromDrag(marqueeDraft.ax, marqueeDraft.ay, marqueeDraft.bx, marqueeDraft.by)
+          : rectFromDrag(marqueeDraft.ax, marqueeDraft.ay, marqueeDraft.bx, marqueeDraft.by);
+      strokeShape(ctx, shape, view);
+    }
+    if (lassoDraft && lassoDraft.length > 1) {
+      strokeShape(ctx, { kind: "lasso", points: lassoDraft }, view);
+    }
+  }, [doc, view, viewportSize, compositeVersion, selectionEcho, marqueeDraft, lassoDraft, tool]);
 
   // 滚轮缩放（以光标为锚；非被动监听才能 preventDefault）
   useEffect(() => {
@@ -172,7 +260,8 @@ export function CanvasView() {
     return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
-  // —— 指针交互：平移拖拽 / 坐标回报 / 吸管取色 ——
+  // —— 指针交互：平移拖拽 / 坐标回报 / 吸管取色 / 选区圈选 ——
+
   const dragRef = useRef<{ lastX: number; lastY: number } | null>(null);
 
   /** 屏幕（容器）坐标 → 图像格点 + 悬停色；图像外 → null/null。 */
@@ -195,8 +284,55 @@ export function CanvasView() {
     return { px: e.clientX - rect.left, py: e.clientY - rect.top };
   };
 
+  /** 屏幕坐标 → 图像坐标（选区几何用，不取整）。 */
+  const toImagePos = (px: number, py: number): { x: number; y: number } | null => {
+    const view = selectActiveView(useDocsStore.getState());
+    if (!view) return null;
+    return screenToImage(px, py, view);
+  };
+
+  const reportError = (err: unknown) => {
+    useDocsStore.getState().setMessage({
+      kind: "error",
+      text: err instanceof Error ? err.message : String(err),
+    });
+  };
+
+  /** 提交选区（形状过小按「点击取消选区」处理——Photoshop 惯例）。 */
+  const commitMarquee = (draft: MarqueeDraft) => {
+    const activeId = useDocsStore.getState().activeId;
+    if (activeId === null) return;
+    const shape =
+      tool === "marquee-ellipse"
+        ? ellipseFromDrag(draft.ax, draft.ay, draft.bx, draft.by)
+        : rectFromDrag(draft.ax, draft.ay, draft.bx, draft.by);
+    if (isTinyShape(shape)) {
+      deselect(activeId).catch(reportError);
+    } else {
+      commitSelection(activeId, shape).catch(reportError);
+    }
+  };
+
+  const commitLasso = (points: [number, number][]) => {
+    const activeId = useDocsStore.getState().activeId;
+    if (activeId === null) return;
+    const shape = closeLasso(points);
+    if (shape === null) {
+      deselect(activeId).catch(reportError);
+    } else {
+      commitSelection(activeId, shape).catch(reportError);
+    }
+  };
+
   const panning = tool === "hand" || spaceHeld;
-  const cursorStyle = dragRef.current ? "grabbing" : panning ? "grab" : tool === "eyedropper" ? "crosshair" : "default";
+  const isSelectTool = tool === "marquee-rect" || tool === "marquee-ellipse" || tool === "lasso";
+  const cursorStyle = dragRef.current
+    ? "grabbing"
+    : panning
+      ? "grab"
+      : isSelectTool || tool === "eyedropper"
+        ? "crosshair"
+        : "default";
 
   return (
     <div ref={containerRef} className="mo-canvas-container">
@@ -209,6 +345,15 @@ export function CanvasView() {
           if (panning || e.button === 1) {
             e.currentTarget.setPointerCapture(e.pointerId);
             dragRef.current = { lastX: e.clientX, lastY: e.clientY };
+          } else if (e.button === 0 && isSelectTool) {
+            const pt = toImagePos(px, py);
+            if (!pt) return;
+            e.currentTarget.setPointerCapture(e.pointerId);
+            if (tool === "lasso") {
+              setLassoDraft([[pt.x, pt.y]]);
+            } else {
+              setMarqueeDraft({ ax: pt.x, ay: pt.y, bx: pt.x, by: pt.y });
+            }
           } else if (e.button === 0 && tool === "eyedropper") {
             const { color } = probe(px, py);
             if (color) useDocsStore.getState().pickColor(color);
@@ -223,6 +368,24 @@ export function CanvasView() {
             return; // 平移中不更新取色（像素在动，等停手再回填）
           }
           const { px, py } = localPos(e);
+          if (selecting) {
+            // 选区拖拽中：更新草稿几何（套索按屏幕 2px 距离采点，避免顶点爆炸）
+            const pt = toImagePos(px, py);
+            if (!pt) return;
+            if (marqueeDraft) {
+              setMarqueeDraft({ ...marqueeDraft, bx: pt.x, by: pt.y });
+            } else if (lassoDraft) {
+              const last = lassoDraft[lassoDraft.length - 1];
+              const view = selectActiveView(useDocsStore.getState());
+              if (!view) return;
+              const dxScreen = (pt.x - last[0]) * view.zoom;
+              const dyScreen = (pt.y - last[1]) * view.zoom;
+              if (dxScreen * dxScreen + dyScreen * dyScreen >= 4) {
+                setLassoDraft([...lassoDraft, [pt.x, pt.y]]);
+              }
+            }
+            return;
+          }
           const { point, color } = probe(px, py);
           useDocsStore.getState().setCursor(point, color);
         }}
@@ -230,10 +393,24 @@ export function CanvasView() {
           if (dragRef.current) {
             dragRef.current = null;
             e.currentTarget.releasePointerCapture(e.pointerId);
+            return;
+          }
+          if (marqueeDraft) {
+            const draft = marqueeDraft;
+            setMarqueeDraft(null);
+            e.currentTarget.releasePointerCapture(e.pointerId);
+            commitMarquee(draft);
+          } else if (lassoDraft) {
+            const draft = lassoDraft;
+            setLassoDraft(null);
+            e.currentTarget.releasePointerCapture(e.pointerId);
+            commitLasso(draft);
           }
         }}
         onPointerCancel={() => {
           dragRef.current = null;
+          setMarqueeDraft(null);
+          setLassoDraft(null);
         }}
         onPointerLeave={() => {
           useDocsStore.getState().setCursor(null, null);

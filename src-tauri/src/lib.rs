@@ -1,8 +1,11 @@
 // 百工·墨（Mo）：以图层为中心的位图编辑工具。
 // M0 骨架：空窗口外壳 + app_info 命令；M1：图像管线（imageio.rs——打开/像素/另存/关闭，
-// 选型定案见 docs/图像库选型.md）。M2+ 的图层/选区命令随里程碑挂进 invoke_handler。
+// 选型定案见 docs/图像库选型.md）；M2：图层栈与合成（layers.rs）、选区栅格化
+// （selection.rs）——文档模型升级为图层栈，get_pixels/另存返回合成结果。
 
 mod imageio;
+mod layers;
+mod selection;
 
 use serde::Serialize;
 
@@ -30,9 +33,22 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_info,
             imageio::open_image,
+            imageio::new_document_cmd,
             imageio::get_pixels,
             imageio::save_document,
             imageio::close_document,
+            layers::get_layers,
+            layers::add_layer,
+            layers::delete_layer,
+            layers::move_layer,
+            layers::set_layer_visible,
+            layers::set_layer_opacity,
+            layers::set_layer_blend_mode,
+            layers::set_active_layer,
+            layers::set_selection,
+            layers::select_all,
+            layers::deselect,
+            layers::fill_active_layer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running mo");

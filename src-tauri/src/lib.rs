@@ -1,10 +1,12 @@
-// 百工·墨（Mo）：以图层为中心的位图编辑工具。M0 骨架 = 空窗口外壳 + app_info 命令。
-// 图像编解码选型评审中（docs/图像库选型.md），本阶段不引入图像处理依赖；
-// M1 起的打开/保存/像素访问命令随选型落位再挂进 invoke_handler。
+// 百工·墨（Mo）：以图层为中心的位图编辑工具。
+// M0 骨架：空窗口外壳 + app_info 命令；M1：图像管线（imageio.rs——打开/像素/另存/关闭，
+// 选型定案见 docs/图像库选型.md）。M2+ 的图层/选区命令随里程碑挂进 invoke_handler。
+
+mod imageio;
 
 use serde::Serialize;
 
-/// 应用元信息：前端骨架页 invoke("app_info") 的返回契约（src/App.tsx）。
+/// 应用元信息：前端「关于」显示的返回契约。
 /// version 与 tauri.conf.json 的 version 同源维护（发布前一同提升）。
 #[derive(Debug, Serialize)]
 pub struct AppInfo {
@@ -23,7 +25,15 @@ fn app_info() -> AppInfo {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![app_info])
+        .plugin(tauri_plugin_dialog::init())
+        .manage(imageio::Documents::new())
+        .invoke_handler(tauri::generate_handler![
+            app_info,
+            imageio::open_image,
+            imageio::get_pixels,
+            imageio::save_document,
+            imageio::close_document,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running mo");
 }

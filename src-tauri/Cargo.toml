@@ -18,10 +18,13 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-# app_info 命令返回结构的序列化（M0 骨架唯一自研命令）
+tauri-plugin-dialog = "2"
+# 命令返回结构的序列化（app_info / M1 图像命令）
 serde = { version = "1", features = ["derive"] }
-# 图像编解码依赖（image 系等）待选型评审定档后于 M1 引入（docs/图像库选型.md），
-# M0 骨架刻意不引任何图像处理依赖。
+# M1 图像管线（docs/图像库选型.md 定案）：image 0.25.x 默认 feature（含 rayon）为总入口，
+# JPEG 解码走内置 zune-jpeg、PNG 编解码走内置 png 0.18.x；内部工作格式 RGBA8。
+# 底层 zune-jpeg/png 未直引——M1 只用 image 层 API，需要块级控制时再按选型文档直达。
+image = "0.25"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

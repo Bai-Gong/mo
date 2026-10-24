@@ -1,5 +1,4 @@
 /* 百工·墨 全局样式：视觉取值一律 var(--fang-*) 设计 token，禁裸色值。 */
-/* M0 只有骨架欢迎页；M1 起面板/画布样式随功能自包含落位（参照 jian 的 features/ 约定）。 */
 
 html,
 body,
@@ -13,12 +12,156 @@ body {
   font-size: var(--fang-font-size-md);
   color: var(--fang-color-text);
   background: var(--fang-color-bg);
-  overflow: hidden; /* 桌面应用形态：页面自身不滚动，滚动收敛在各面板内 */
+  overflow: hidden; /* 桌面应用形态：页面自身不滚动，滚动收敛在画布/面板内 */
 }
 
-/* —— M0 欢迎页（空窗口骨架）：居中三行信息 —— */
-.mo-welcome {
+/* —— 应用外壳：标题栏 +（工具栏 | 画布区） —— */
+
+.app-shell {
   height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.app-canvas-area {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* —— 左侧工具栏（产品分析：竖排，同类长按展开后置） —— */
+
+.mo-toolbar {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--fang-space-1);
+  padding: var(--fang-space-2) var(--fang-space-1);
+  background: var(--fang-color-bg-raised);
+  border-right: 1px solid var(--fang-color-border);
+}
+
+.mo-toolbar__btn {
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: var(--fang-radius-sm);
+  background: transparent;
+  color: var(--fang-color-text-secondary);
+  cursor: pointer;
+}
+
+.mo-toolbar__btn:hover {
+  background: var(--fang-color-hover);
+  color: var(--fang-color-text);
+}
+
+.mo-toolbar__btn--active,
+.mo-toolbar__btn--active:hover {
+  background: var(--fang-color-selected);
+  border-color: var(--fang-color-accent);
+  color: var(--fang-color-text);
+}
+
+/* —— 多文档标签栏 —— */
+
+.mo-tabs {
+  flex: none;
+  display: flex;
+  gap: var(--fang-space-1);
+  padding: var(--fang-space-1) var(--fang-space-2);
+  background: var(--fang-color-bg-raised);
+  border-bottom: 1px solid var(--fang-color-border);
+  overflow-x: auto;
+}
+
+.mo-tabs__tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--fang-space-2);
+  padding: var(--fang-space-1) var(--fang-space-2);
+  border: 1px solid var(--fang-color-border);
+  border-radius: var(--fang-radius-sm);
+  background: var(--fang-color-bg);
+  color: var(--fang-color-text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.mo-tabs__tab:hover {
+  background: var(--fang-color-hover);
+  color: var(--fang-color-text);
+}
+
+.mo-tabs__tab--active,
+.mo-tabs__tab--active:hover {
+  background: var(--fang-color-selected);
+  border-color: var(--fang-color-accent);
+  color: var(--fang-color-text);
+}
+
+.mo-tabs__name {
+  max-width: 14em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mo-tabs__size {
+  font-family: var(--fang-font-mono);
+  font-size: var(--fang-font-size-xs);
+  color: var(--fang-color-text-muted);
+}
+
+.mo-tabs__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: var(--fang-radius-sm);
+  background: transparent;
+  color: var(--fang-color-text-muted);
+  cursor: pointer;
+}
+
+.mo-tabs__close:hover {
+  background: var(--fang-color-hover);
+  color: var(--fang-color-text);
+}
+
+/* —— 画布视口（灰画布外区域 + 透明棋盘格在 canvas 内绘制） —— */
+
+.mo-canvas-container {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  background: var(--fang-color-bg-raised); /* 画布外灰区（产品分析） */
+}
+
+.mo-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none; /* 指针交互自管（平移/取色），禁浏览器手势 */
+}
+
+/* —— 空态 —— */
+
+.mo-empty {
+  flex: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -26,22 +169,159 @@ body {
   gap: var(--fang-space-2);
 }
 
-.mo-welcome__title {
+.mo-empty__title {
   margin: 0;
-  font-size: var(--fang-font-size-xl);
-  font-weight: 600;
-  letter-spacing: 0.12em;
+  font-size: var(--fang-font-size-lg);
 }
 
-.mo-welcome__meta {
+.mo-empty__note {
   margin: 0;
-  font-family: var(--fang-font-mono);
   font-size: var(--fang-font-size-sm);
   color: var(--fang-color-text-muted);
 }
 
-.mo-welcome__note {
-  margin: 0;
+/* —— 状态栏 —— */
+
+.mo-statusbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--fang-space-4);
+  padding: var(--fang-space-1) var(--fang-space-3);
+  background: var(--fang-color-bg-raised);
+  border-top: 1px solid var(--fang-color-border);
   font-size: var(--fang-font-size-sm);
   color: var(--fang-color-text-secondary);
+  user-select: none;
+}
+
+.mo-statusbar__group {
+  display: flex;
+  align-items: center;
+  gap: var(--fang-space-2);
+}
+
+.mo-statusbar__group--mono {
+  font-family: var(--fang-font-mono);
+  font-size: var(--fang-font-size-xs);
+}
+
+.mo-statusbar__group--right {
+  margin-left: auto;
+}
+
+.mo-statusbar__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--fang-radius-sm);
+  background: transparent;
+  color: var(--fang-color-text-secondary);
+  cursor: pointer;
+}
+
+.mo-statusbar__btn:hover:not(:disabled) {
+  background: var(--fang-color-hover);
+  color: var(--fang-color-text);
+}
+
+.mo-statusbar__btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.mo-statusbar__zoom {
+  min-width: 4.5em;
+  text-align: center;
+  font-family: var(--fang-font-mono);
+  font-size: var(--fang-font-size-xs);
+  color: var(--fang-color-text);
+}
+
+.mo-statusbar__icc {
+  padding: 0 var(--fang-space-1);
+  border: 1px solid var(--fang-color-border-strong);
+  border-radius: var(--fang-radius-sm);
+  font-family: var(--fang-font-mono);
+  font-size: var(--fang-font-size-xs);
+  color: var(--fang-color-warning);
+  cursor: help;
+}
+
+.mo-statusbar__color {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--fang-space-2);
+}
+
+.mo-statusbar__swatch {
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--fang-color-border-strong);
+  border-radius: var(--fang-radius-sm);
+}
+
+.mo-statusbar__hex {
+  font-family: var(--fang-font-mono);
+  font-size: var(--fang-font-size-xs);
+  color: var(--fang-color-text);
+}
+
+/* —— 标题栏动作区（按钮 + 消息） —— */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--fang-space-1);
+  padding: var(--fang-space-1) var(--fang-space-3);
+  border: 1px solid var(--fang-color-border-strong);
+  border-radius: var(--fang-radius-sm);
+  background: var(--fang-color-bg-overlay);
+  color: var(--fang-color-text);
+  font: var(--fang-font-size-md)/1 var(--fang-font-family);
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--fang-color-hover);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.btn--primary {
+  background: var(--fang-color-accent);
+  border-color: var(--fang-color-accent);
+  color: #fff;
+}
+
+.btn--primary:hover:not(:disabled) {
+  background: var(--fang-color-accent-hover);
+}
+
+.top-bar__doc-hint {
+  font-size: var(--fang-font-size-sm);
+  color: var(--fang-color-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.top-bar__msg {
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fang-font-size-xs);
+  color: var(--fang-color-success);
+}
+
+.top-bar__msg--error {
+  color: var(--fang-color-danger);
 }

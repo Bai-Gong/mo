@@ -1,0 +1,47 @@
+/* 百工·墨 全局样式：视觉取值一律 var(--fang-*) 设计 token，禁裸色值。 */
+/* M0 只有骨架欢迎页；M1 起面板/画布样式随功能自包含落位（参照 jian 的 features/ 约定）。 */
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--fang-font-family);
+  font-size: var(--fang-font-size-md);
+  color: var(--fang-color-text);
+  background: var(--fang-color-bg);
+  overflow: hidden; /* 桌面应用形态：页面自身不滚动，滚动收敛在各面板内 */
+}
+
+/* —— M0 欢迎页（空窗口骨架）：居中三行信息 —— */
+.mo-welcome {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--fang-space-2);
+}
+
+.mo-welcome__title {
+  margin: 0;
+  font-size: var(--fang-font-size-xl);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+}
+
+.mo-welcome__meta {
+  margin: 0;
+  font-family: var(--fang-font-mono);
+  font-size: var(--fang-font-size-sm);
+  color: var(--fang-color-text-muted);
+}
+
+.mo-welcome__note {
+  margin: 0;
+  font-size: var(--fang-font-size-sm);
+  color: var(--fang-color-text-secondary);
+}

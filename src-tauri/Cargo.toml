@@ -1,0 +1,39 @@
+[package]
+name = "mo"
+version = "0.1.0"
+description = "百工·墨 — 图像编辑工具"
+authors = ["guyuemochen"]
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may necessary to make the lib name unique and wouldn't conflict with the bin name.
+# This is only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "mo_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+# app_info 命令返回结构的序列化（M0 骨架唯一自研命令）
+serde = { version = "1", features = ["derive"] }
+# 图像编解码依赖（image 系等）待选型评审定档后于 M1 引入（docs/图像库选型.md），
+# M0 骨架刻意不引任何图像处理依赖。
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+# 本机 Kaspersky 会拦截默认参数编译出的 tauri 系构建脚本二进制（jian 仓库实测 os error 32，
+# 按内容缓存的判定，确定性构建导致每次必中）。改 build-override 参数即改变二进制内容，
+# 实测绕开判定（2026-10-19）。若再被盯上，微调本节参数即可。
+[profile.dev.build-override]
+opt-level = 1
+debug = false

@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* fang 本地联调：vite 走 resolve.alias，tsc 走这里的 paths（双轨同源）。
+       TS6 起 paths 相对 tsconfig 所在目录解析，无需 baseUrl。 */
+    "paths": {
+      "@baigong/fang/tokens.css": ["../fang/src/theme/tokens.css"],
+      "@baigong/fang": ["../fang/src/index.ts"]
+    },
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src"],
+  "references": [{ "path": "./tsconfig.node.json" }]
+}

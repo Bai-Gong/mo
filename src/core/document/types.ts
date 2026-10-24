@@ -21,8 +21,17 @@ export interface ImageDocMeta {
   path: string;
 }
 
-/** M2 工具集：抓手（平移画布）/ 吸管（取色）/ 矩形选框 / 椭圆选框 / 套索。 */
-export type Tool = "hand" | "eyedropper" | "marquee-rect" | "marquee-ellipse" | "lasso";
+/** 工具集：抓手（平移）/ 吸管（取色）/ 矩形·椭圆·套索选区（M2）/
+ * 画笔·橡皮·裁剪（M3）。 */
+export type Tool =
+  | "hand"
+  | "eyedropper"
+  | "marquee-rect"
+  | "marquee-ellipse"
+  | "lasso"
+  | "brush"
+  | "eraser"
+  | "crop";
 
 /** M2 混合模式名（Rust `BlendMode::parse` 的字符串契约）。 */
 export type BlendModeName = "normal" | "multiply" | "screen" | "overlay";
@@ -53,4 +62,24 @@ export interface Viewport {
   zoom: number;
   panX: number;
   panY: number;
+}
+
+/**
+ * 历史面板快照（Rust `HistoryInfo` 契约，M3）：entries 为条目标签序列
+ * （自最早幸存条目起，超上限丢最旧），index 为已应用条数（0 = 初始状态）。
+ */
+export interface HistoryMeta {
+  entries: string[];
+  index: number;
+}
+
+/** 画笔/橡皮笔画参数（paint_stroke 命令契约；points 为图像坐标折线）。 */
+export interface StrokeParams {
+  points: [number, number][];
+  /** 半径（px）。前端「笔刷大小」为直径，传 size/2。 */
+  radius: number;
+  /** RGBA；橡皮路径下 alpha 当擦除强度。 */
+  color: [number, number, number, number];
+  /** true = 橡皮（destination-out），false = 画笔（source-over）。 */
+  erase: boolean;
 }

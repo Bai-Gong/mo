@@ -12,7 +12,7 @@
  *   CanvasView 据版本号重建离屏源画布。
  */
 import { create } from "zustand";
-import type { ImageDocMeta, LayerMeta, Tool, Viewport } from "./types";
+import type { HistoryMeta, ImageDocMeta, LayerMeta, Tool, Viewport } from "./types";
 import {
   actualSizeViewport,
   fitViewport,
@@ -42,7 +42,11 @@ export interface DocsState {
   selection: Record<number, SelectionShape | null>;
   /** docId → 合成版本号（像素重拉后 +1，画布源缓存失效依据）。 */
   compositeVersion: Record<number, number>;
+  /** docId → 历史快照（Rust HistoryInfo 的影子；null = 未拉取）。 */
+  history: Record<number, HistoryMeta | null>;
   tool: Tool;
+  /** 笔刷大小（直径 px，画笔/橡皮共用；半径 = size/2 下传 Rust）。 */
+  brushSize: number;
   /** 光标所在图像像素坐标（图像外/无文档为 null）。 */
   cursor: { x: number; y: number } | null;
   /** 光标下像素颜色（实时预览）。 */
@@ -73,6 +77,12 @@ export interface DocsState {
   setMessage(message: StatusMessage | null): void;
   /** 图层快照落位（layerPipeline 在命令成功后调用）。 */
   setLayers(docId: number, layers: LayerMeta[], activeLayerId: number): void;
+  /** 历史快照落位（编辑命令/撤销重做/面板拉取后调用）。 */
+  setHistory(docId: number, history: HistoryMeta): void;
+  /** 文档尺寸变化（裁剪/撤销重做）：更新元信息并把视图标记待「适合窗口」。 */
+  resizeDoc(docId: number, width: number, height: number): void;
+  /** 笔刷大小（直径 px，钳到 1–512）。 */
+  setBrushSize(size: number): void;
   /** 选区回显落位（null = 取消选择）。 */
   setSelectionEcho(docId: number, shape: SelectionShape | null): void;
   /** 合成像素已重拉，画布源缓存应失效。 */
@@ -107,7 +117,9 @@ export const useDocsStore = create<DocsState>()((set, get) => ({
   activeLayerId: {},
   selection: {},
   compositeVersion: {},
+  history: {},
   tool: "hand",
+  brushSize: 8,
   cursor: null,
   hoverColor: null,
   pickedColor: null,
@@ -123,10 +135,11 @@ export const useDocsStore = create<DocsState>()((set, get) => ({
       activeLayerId: { ...s.activeLayerId, [meta.id]: 0 },
       selection: { ...s.selection, [meta.id]: null },
       compositeVersion: { ...s.compositeVersion, [meta.id]: 0 },
+      history: { ...s.history, [meta.id]: null },
     })),
 
   closeTab: (id) => {
-    const { docs, activeId, views, layers, activeLayerId, selection, compositeVersion } = get();
+    const { docs, activeId, views, layers, activeLayerId, selection, compositeVersion, history } = get();
     const index = docs.findIndex((d) => d.id === id);
     if (index < 0) return;
     const rest = docs.filter((d) => d.id !== id);
@@ -140,6 +153,8 @@ export const useDocsStore = create<DocsState>()((set, get) => ({
     delete nextSelection[id];
     const nextVersion = { ...compositeVersion };
     delete nextVersion[id];
+    const nextHistory = { ...history };
+    delete nextHistory[id];
     // 关的是活动标签 → 让位左邻，无左邻取右邻；全关 → null
     const nextActive =
       activeId === id ? (rest[Math.max(0, index - 1)]?.id ?? null) : activeId;
@@ -150,6 +165,7 @@ export const useDocsStore = create<DocsState>()((set, get) => ({
       activeLayerId: nextActiveLayer,
       selection: nextSelection,
       compositeVersion: nextVersion,
+      history: nextHistory,
       activeId: nextActive,
       cursor: activeId === id ? null : get().cursor,
     });
@@ -237,6 +253,22 @@ export const useDocsStore = create<DocsState>()((set, get) => ({
       layers: { ...s.layers, [docId]: layers },
       activeLayerId: { ...s.activeLayerId, [docId]: activeLayerId },
     })),
+
+  setHistory: (docId, history) =>
+    set((s) => ({ history: { ...s.history, [docId]: history } })),
+
+  resizeDoc: (docId, width, height) =>
+    set((s) => {
+      const doc = s.docs.find((d) => d.id === docId);
+      if (!doc || (doc.width === width && doc.height === height)) return s;
+      return {
+        docs: s.docs.map((d) => (d.id === docId ? { ...d, width, height } : d)),
+        // 尺寸变了，旧视图锚点失去意义：回到「适合窗口」（null = 待适配）
+        views: { ...s.views, [docId]: null },
+      };
+    }),
+
+  setBrushSize: (size) => set({ brushSize: Math.min(512, Math.max(1, Math.round(size))) }),
 
   setSelectionEcho: (docId, shape) =>
     set((s) => ({ selection: { ...s.selection, [docId]: shape } })),

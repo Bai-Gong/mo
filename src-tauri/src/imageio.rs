@@ -26,7 +26,8 @@ use serde::Serialize;
 use tauri::ipc::Response;
 use tauri::State;
 
-use crate::layers::{composite, LayerStack};
+use crate::history::{self, History};
+use crate::layers::{composite, EditResult, LayerStack};
 use crate::selection::Selection;
 
 /// 打开文件解码后首层的固定名（Photoshop「背景」惯例）。
@@ -46,9 +47,10 @@ pub struct OpenedImageInfo {
     pub format: String,
 }
 
-/// 图像文档：图层栈 + 选区 + 打开时读出的 ICC。
+/// 图像文档：图层栈 + 选区 + 命令式历史栈 + 打开时读出的 ICC。
 ///
 /// M2 起像素事实源是 `stack`（自底向上）；`composite()` 产出扁平 RGBA8。
+/// M3 起 `history` 记录可逆编辑命令（见 history.rs），撤销重做在此栈上运转。
 #[derive(Debug)]
 pub struct ImageDocument {
     pub width: u32,
@@ -58,6 +60,8 @@ pub struct ImageDocument {
     pub selection: Option<Selection>,
     /// 填充等像素操作的落点图层。
     pub active_layer_id: u32,
+    /// 命令式历史栈（撤销/重做/历史面板的事实源）。
+    pub history: History,
     pub icc_profile: Option<Vec<u8>>,
     pub format: ImageFormat,
 }
@@ -170,6 +174,7 @@ fn decode_image_inner(path: &Path) -> Result<ImageDocument, String> {
         stack,
         selection: None,
         active_layer_id,
+        history: History::default(),
         icc_profile,
         format,
     })
@@ -205,9 +210,55 @@ pub fn new_document(
         stack,
         selection: None,
         active_layer_id,
+        history: History::default(),
         icc_profile: None,
         format: ImageFormat::Png,
     })
+}
+
+/// 裁剪：把整栈裁到矩形（浮点几何 → 四舍五入到像素边界），文档尺寸随之
+/// 变化、选区清空（尺寸变了蒙版随之作废）。条目持有整栈快照供撤销。
+///
+/// 返回是否真的发生了变更（矩形与整幅相同 → false，不压历史）。
+pub fn apply_crop(doc: &mut ImageDocument, x: f64, y: f64, w: f64, h: f64) -> Result<bool, String> {
+    if !(w.is_finite() && h.is_finite() && x.is_finite() && y.is_finite()) {
+        return Err("裁剪矩形含非有限数值".into());
+    }
+    let round_clamp = |v: f64, lo: i64, hi: i64| v.round().clamp(lo as f64, hi as f64) as i64;
+    let left = round_clamp(x, 0, doc.width as i64);
+    let top = round_clamp(y, 0, doc.height as i64);
+    let right = round_clamp(x + w, 0, doc.width as i64);
+    let bottom = round_clamp(y + h, 0, doc.height as i64);
+    if right - left < 1 || bottom - top < 1 {
+        let (cw_err, ch_err) = (right - left, bottom - top);
+        return Err(format!("裁剪区域过小（{cw_err}×{ch_err}），至少保留 1×1 像素"));
+    }
+    let (cw, ch) = ((right - left) as u32, (bottom - top) as u32);
+    if (left, top) == (0, 0) && (cw, ch) == (doc.width, doc.height) {
+        return Ok(false); // 裁剪框 = 整幅，无变更
+    }
+    let before_layers: Vec<crate::layers::Layer> =
+        doc.stack.iter().cloned().collect();
+    let (before_width, before_height) = (doc.width, doc.height);
+    let active_before = doc.active_layer_id;
+    let rect = (left as u32, top as u32, cw, ch);
+    for layer in doc.stack.iter_mut() {
+        layer.pixels = image::imageops::crop_imm(&layer.pixels, rect.0, rect.1, rect.2, rect.3)
+            .to_image();
+    }
+    doc.width = cw;
+    doc.height = ch;
+    doc.selection = None;
+    doc.history.push(history::HistoryEntry::Crop {
+        label: "裁剪".into(),
+        rect,
+        before_layers,
+        before_width,
+        before_height,
+        active_before,
+        active_after: active_before,
+    });
+    Ok(true)
 }
 
 /// 另存格式（M1 支持面，与选型范围一致）。
@@ -350,6 +401,82 @@ pub fn close_document(doc_id: u32, documents: State<Documents>) -> bool {
     documents.remove(doc_id)
 }
 
+/// 裁剪文档（整栈 + 尺寸）。矩形为图像坐标浮点几何，四舍五入到像素边界。
+#[tauri::command]
+pub fn crop_document(
+    doc_id: u32,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    documents: State<Documents>,
+) -> Result<EditResult, String> {
+    documents.with_doc_mut(doc_id, |doc| {
+        apply_crop(doc, x, y, w, h)?;
+        Ok(EditResult {
+            layers: crate::layers::snapshot(doc),
+            history: doc.history.info(),
+            width: doc.width,
+            height: doc.height,
+        })
+    })?
+}
+
+/// 撤销一步（无可撤销时安静返回当前状态）。
+#[tauri::command]
+pub fn undo(doc_id: u32, documents: State<Documents>) -> Result<EditResult, String> {
+    documents.with_doc_mut(doc_id, |doc| {
+        history::undo(doc);
+        EditResult {
+            layers: crate::layers::snapshot(doc),
+            history: doc.history.info(),
+            width: doc.width,
+            height: doc.height,
+        }
+    })
+}
+
+/// 重做一步。
+#[tauri::command]
+pub fn redo(doc_id: u32, documents: State<Documents>) -> Result<EditResult, String> {
+    documents.with_doc_mut(doc_id, |doc| {
+        history::redo(doc);
+        EditResult {
+            layers: crate::layers::snapshot(doc),
+            history: doc.history.info(),
+            width: doc.width,
+            height: doc.height,
+        }
+    })
+}
+
+/// 历史面板跳转：退/进到「第 target 条已应用」（0 = 初始状态）。
+#[tauri::command]
+pub fn history_jump(
+    doc_id: u32,
+    target: u32,
+    documents: State<Documents>,
+) -> Result<EditResult, String> {
+    documents.with_doc_mut(doc_id, |doc| {
+        history::jump(doc, target);
+        EditResult {
+            layers: crate::layers::snapshot(doc),
+            history: doc.history.info(),
+            width: doc.width,
+            height: doc.height,
+        }
+    })
+}
+
+/// 历史面板一次拉取（标签打开/切换时刷新面板用）。
+#[tauri::command]
+pub fn get_history(
+    doc_id: u32,
+    documents: State<Documents>,
+) -> Result<history::HistoryInfo, String> {
+    documents.with_doc(doc_id, |doc| doc.history.info())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +519,7 @@ mod tests {
             stack,
             selection: None,
             active_layer_id,
+            history: History::default(),
             icc_profile: icc,
             format: ImageFormat::Png,
         }
@@ -733,5 +861,163 @@ mod tests {
         apply_fill(&mut doc, [0, 0, 255, 255]).expect("无选区整层填充");
         let layer = &doc.stack.iter().next().unwrap().pixels;
         assert_eq!(layer.get_pixel(0, 0).0, [0, 0, 255, 255], "取消选区后整层填充");
+    }
+
+    // —— M3 准入场景：从零画一张图（中途含改错与回退）——
+    //
+    // 场景编排（与产品路径同一条内核：new_document → edit_stroke → 撤销 →
+    // 重做 → 继续绘制 → 导出 PNG → 重新打开）：
+    //   1. 从零新建 96×64 白底文档；
+    //   2. 画笔绘「地平线」（绿色横线，正确的一笔）；
+    //   3. 画笔绘「太阳」——画错了（位置偏出构图，红色斜线）；
+    //   4. 撤销（回退错误一笔）→ 验证红线消失、绿线仍在、历史游标回退；
+    //   5. 重做（改回主意，保留太阳）→ 验证红线精确复现；
+    //   6. 继续绘制（蓝色第二笔地平线）→ 验证历史前进、新笔落位；
+    //   7. 中途撤销两次再重做两次（历史面板跳转的内核路径）；
+    //   8. 导出 PNG（真实编码）→ 重新打开（真实解码）→ 校验尺寸与关键像素。
+    #[test]
+    fn m3_准入_从零画图_改错回退_撤销重做后继续绘制_导出_png() {
+        use crate::history::{redo, undo as undo_one};
+        use crate::layers::edit_fill;
+        use crate::paint::edit_stroke;
+
+        const W: u32 = 96;
+        const H: u32 = 64;
+        let mut doc = new_document(W, H, Some([255, 255, 255, 255])).expect("从零新建白底文档");
+        assert_eq!(doc.history.info().index, 0, "新文档历史为空");
+
+        // 1) 正确的一笔：地平线（绿色横线，y≈44）
+        edit_stroke(&mut doc, &[[8.0, 44.0], [88.0, 44.0]], 2.0, [34, 139, 34, 255], false)
+            .expect("画地平线");
+        // 2) 改错的一笔：太阳画偏了（红色斜线，扎到天空外）
+        edit_stroke(&mut doc, &[[60.0, 8.0], [92.0, 2.0]], 2.5, [255, 0, 0, 255], false)
+            .expect("画错位的太阳");
+        let (index, labels) = {
+            let info = doc.history.info();
+            (info.index, info.entries)
+        };
+        assert_eq!(index, 2, "两笔各压一条历史");
+        assert_eq!(labels, vec!["画笔", "画笔"], "历史面板标签应为两条画笔");
+        let wrong_stroke_px = doc.composite().get_pixel(76, 5).0;
+        assert_eq!(wrong_stroke_px, [255, 0, 0, 255], "错误一笔应可见（红色）");
+
+        // 3) 撤销：回退错误的一笔
+        assert!(undo_one(&mut doc));
+        assert_eq!(doc.history.info().index, 1, "撤销后游标回退一格");
+        let c = doc.composite();
+        assert_eq!(
+            c.get_pixel(76, 5).0,
+            [255, 255, 255, 255],
+            "撤销后错误一笔应消失（回到白底）"
+        );
+        assert_eq!(
+            c.get_pixel(48, 45).0,
+            [34, 139, 34, 255],
+            "撤销只回退最后一笔，地平线应保留"
+        );
+
+        // 4) 重做：改回主意，太阳回来（逐字节精确复现）
+        assert!(redo(&mut doc));
+        assert_eq!(doc.history.info().index, 2);
+        assert_eq!(
+            doc.composite().get_pixel(76, 5).0,
+            wrong_stroke_px,
+            "重做后错误一笔应精确复现（供继续修改）"
+        );
+
+        // 5) 继续绘制：蓝色第二笔（水面）
+        edit_stroke(&mut doc, &[[8.0, 54.0], [88.0, 54.0]], 1.5, [30, 90, 210, 255], false)
+            .expect("继续绘制水面");
+        assert_eq!(doc.history.info().index, 3, "继续绘制历史前进");
+        assert_eq!(
+            doc.composite().get_pixel(48, 54).0,
+            [30, 90, 210, 255],
+            "继续绘制的新笔应落位（线芯像素满覆盖）"
+        );
+
+        // 6) 历史面板跳转内核：退两格（回到只有地平线）再进两格回来
+        crate::history::jump(&mut doc, 1);
+        let c = doc.composite();
+        assert_eq!(c.get_pixel(76, 5).0, [255, 255, 255, 255], "跳转后太阳应消失");
+        assert_eq!(c.get_pixel(48, 54).0, [255, 255, 255, 255], "跳转后水面应消失");
+        assert_eq!(c.get_pixel(48, 45).0, [34, 139, 34, 255], "地平线仍在");
+        crate::history::jump(&mut doc, 3);
+        let c = doc.composite();
+        assert_eq!(c.get_pixel(76, 5).0, [255, 0, 0, 255], "跳回最前后全部复现");
+        assert_eq!(c.get_pixel(48, 54).0, [30, 90, 210, 255]);
+
+        // 7) 再来一次「改错与回退」：错误填充后撤销（填充也走同一历史栈）
+        edit_fill(&mut doc, [0, 0, 0, 255]).expect("整层误填黑");
+        assert_eq!(doc.composite().get_pixel(2, 2).0, [0, 0, 0, 255], "误填生效");
+        assert!(undo_one(&mut doc));
+        assert_eq!(
+            doc.composite().get_pixel(2, 2).0,
+            [255, 255, 255, 255],
+            "撤销误填后回到绘制结果"
+        );
+        assert_eq!(
+            doc.history.info().entries.last().map(String::as_str),
+            Some("填充"),
+            "填充也压历史（内容操作与结构操作同栈）"
+        );
+
+        // 8) 导出 PNG → 重新打开（真实编解码管线）
+        let path = temp_path("m3-drawing.png");
+        encode_image_file(&doc, &path, SaveFormat::Png, 0).expect("导出 PNG");
+        let reopened = decode_image_file(&path).expect("重新打开");
+        let out = reopened.composite();
+        assert_eq!((reopened.width, reopened.height), (W, H), "尺寸必须精确保持");
+        // 关键像素：地平线绿 / 太阳红 / 水面蓝 / 留白白底
+        assert_eq!(out.get_pixel(48, 45).0, [34, 139, 34, 255], "地平线");
+        assert_eq!(out.get_pixel(76, 5).0, [255, 0, 0, 255], "太阳（重做保留）");
+        assert_eq!(out.get_pixel(48, 54).0, [30, 90, 210, 255], "水面");
+        assert_eq!(out.get_pixel(2, 2).0, [255, 255, 255, 255], "白底");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// M3 裁剪：整栈裁剪 + 撤销复原（尺寸与像素）+ 重做。
+    #[test]
+    fn 裁剪_整栈裁剪_撤销复原_重做复现() {
+        use crate::layers::edit_fill;
+
+        // 两层文档：白底 + 红色涂鸦层
+        let mut doc = new_document(16, 16, Some([255, 255, 255, 255])).expect("新建");
+        crate::layers::edit_add_layer(&mut doc);
+        edit_fill(&mut doc, [255, 0, 0, 255]).expect("涂红");
+        assert_eq!((doc.width, doc.height), (16, 16));
+
+        // 裁到右下 8×8
+        apply_crop(&mut doc, 8.0, 8.0, 8.0, 8.0).expect("裁剪");
+        assert_eq!((doc.width, doc.height), (8, 8), "裁剪后尺寸应变化");
+        for layer in doc.stack.iter() {
+            assert_eq!(layer.pixels.dimensions(), (8, 8), "每层都应随裁剪变尺寸");
+        }
+        assert!(
+            doc.composite().pixels().all(|p| p.0 == [255, 0, 0, 255]),
+            "裁出的区域两层皆满色，合成应为红"
+        );
+        assert_eq!(doc.history.info().entries.last().map(String::as_str), Some("裁剪"));
+
+        // 撤销：尺寸与两层像素完全复原
+        assert!(crate::history::undo(&mut doc));
+        assert_eq!((doc.width, doc.height), (16, 16), "撤销裁剪应复原尺寸");
+        assert_eq!(doc.stack.len(), 2, "撤销裁剪不撤图层结构");
+        let px = doc.composite().get_pixel(4, 4).0;
+        assert_eq!(px, [255, 0, 0, 255], "左上区域应复原为红（涂鸦层在最上）");
+
+        // 重做：再裁一次，与首次结果一致
+        assert!(crate::history::redo(&mut doc));
+        assert_eq!((doc.width, doc.height), (8, 8));
+        assert!(
+            doc.composite().pixels().all(|p| p.0 == [255, 0, 0, 255]),
+            "重做裁剪应精确复现"
+        );
+
+        // 整幅裁剪 = 无操作（不压历史）
+        let before = doc.history.info();
+        assert!(!apply_crop(&mut doc, 0.0, 0.0, 8.0, 8.0).expect("整幅裁剪"));
+        assert_eq!(doc.history.info().index, before.index, "整幅裁剪不压历史");
+        // 过小矩形报错
+        assert!(apply_crop(&mut doc, 4.0, 4.0, 0.2, 0.2).is_err());
     }
 }

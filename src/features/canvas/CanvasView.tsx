@@ -1,12 +1,15 @@
 /**
- * 画布视口：单个活动文档的渲染与交互（M1 核心 + M2 选区）。
+ * 画布视口：单个活动文档的渲染与交互（M1 核心 + M2 选区 + M3 绘制/裁剪）。
  *
- * 渲染：合成像素（Rust get_pixels，M2 起为图层栈合成结果）putImageData 到离屏
+ * 渲染：合成像素（Rust get_pixels，图层栈合成结果）putImageData 到离屏
  * canvas（按 doc+compositeVersion 缓存），视口 canvas 每帧 drawImage 缩放绘制——
  * zoom≥1 关平滑（像素级检视见格点），zoom<1 开平滑。选区（已提交 + 拖拽中）以
- * 白实线+黑虚线双描显示。
+ * 白实线+黑虚线双描显示；画笔/橡皮拖拽中以同宽圆头折线做视觉预览（像素事实
+ * 在松手提交 Rust 后生成）；裁剪拖框外压暗、框内保持。
  * 交互：滚轮以光标为锚缩放；抓手/空格/中键平移；吸管取色；矩形/椭圆选框拖拽、
- * 套索自由圈选（松手提交 Rust 栅格化；拖拽过小/不足 3 点按点击取消选区）。
+ * 套索自由圈选（松手提交 Rust 栅格化；拖拽过小/不足 3 点按点击取消选区）；
+ * 画笔/橡皮拖拽采点（松手一笔提交 paint_stroke，一笔一条历史）；裁剪拖框
+ * （松手提交整栈裁剪）。
  */
 import { useEffect, useRef, useState } from "react";
 import {
@@ -25,7 +28,7 @@ import {
   rectFromDrag,
   type SelectionShape,
 } from "../../core/canvas/selection";
-import { commitSelection, deselect } from "../../core/document/layerPipeline";
+import { commitSelection, cropDoc, deselect, paintStroke } from "../../core/document/layerPipeline";
 import type { Viewport } from "../../core/document/types";
 
 /** docId → 离屏源画布 + 其合成版本（putImageData 一次，版本变才重建）。 */
@@ -121,6 +124,22 @@ interface MarqueeDraft {
   by: number;
 }
 
+/** 画笔/橡皮拖拽会话（图像坐标折线；erase 标记橡皮）。 */
+interface StrokeDraft {
+  points: [number, number][];
+  erase: boolean;
+}
+
+/** 前景色（画笔/填充共用）：吸管最近取到的颜色，未取过用黑。 */
+function foregroundColor(): [number, number, number, number] {
+  const picked = useDocsStore.getState().pickedColor;
+  return picked ? [picked.r, picked.g, picked.b, picked.a] : [0, 0, 0, 255];
+}
+
+function rgbaCss(c: [number, number, number, number], alpha = 1): string {
+  return `rgba(${c[0]},${c[1]},${c[2]},${(c[3] / 255) * alpha})`;
+}
+
 export function CanvasView() {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -136,15 +155,25 @@ export function CanvasView() {
   // 选区工具的拖拽会话（图像坐标）
   const [marqueeDraft, setMarqueeDraft] = useState<MarqueeDraft | null>(null);
   const [lassoDraft, setLassoDraft] = useState<[number, number][] | null>(null);
+  // 画笔/橡皮与裁剪的拖拽会话（图像坐标）
+  const [strokeDraft, setStrokeDraft] = useState<StrokeDraft | null>(null);
+  const [cropDraft, setCropDraft] = useState<MarqueeDraft | null>(null);
+  const brushSize = useDocsStore((s) => s.brushSize);
   const selecting = marqueeDraft !== null || lassoDraft !== null;
 
-  // 按住空格 → 临时抓手（Photoshop 惯例）
+  // 按住空格 → 临时抓手（Photoshop 惯例）；Esc → 取消进行中的拖拽会话
   const [spaceHeld, setSpaceHeld] = useState(false);
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
       if (e.code === "Space" && !e.repeat) {
         e.preventDefault();
         setSpaceHeld(true);
+      }
+      if (e.code === "Escape") {
+        setMarqueeDraft(null);
+        setLassoDraft(null);
+        setStrokeDraft(null);
+        setCropDraft(null);
       }
     };
     const up = (e: KeyboardEvent) => {
@@ -174,11 +203,11 @@ export function CanvasView() {
     return () => ro.disconnect();
   }, []);
 
-  // 活动文档或尺寸到位后补「适合窗口」（幂等）
+  // 活动文档或尺寸到位后补「适合窗口」（幂等；裁剪改尺寸后 views 置 null 重适配）
   useEffect(() => {
     const activeId = useDocsStore.getState().activeId;
     if (activeId !== null) useDocsStore.getState().ensureView(activeId);
-  }, [doc?.id, viewportSize]);
+  }, [doc?.id, doc?.width, doc?.height, viewportSize]);
 
   // 绘制
   useEffect(() => {
@@ -241,7 +270,60 @@ export function CanvasView() {
     if (lassoDraft && lassoDraft.length > 1) {
       strokeShape(ctx, { kind: "lasso", points: lassoDraft }, view);
     }
-  }, [doc, view, viewportSize, compositeVersion, selectionEcho, marqueeDraft, lassoDraft, tool]);
+
+    // 画笔/橡皮拖拽预览：同宽圆头折线（视觉近似；像素事实由 Rust 松手后生成）
+    if (strokeDraft && strokeDraft.points.length > 0) {
+      const color = strokeDraft.erase
+        ? ([255, 255, 255, 160] as [number, number, number, number])
+        : (() => {
+            const c = foregroundColor();
+            return [c[0], c[1], c[2], Math.max(c[3], 40)] as [number, number, number, number];
+          })();
+      const toX = (x: number) => view.panX + x * view.zoom;
+      const toY = (y: number) => view.panY + y * view.zoom;
+      ctx.save();
+      ctx.strokeStyle = rgbaCss(color);
+      ctx.fillStyle = rgbaCss(color);
+      ctx.lineWidth = Math.max(brushSize * view.zoom, 1);
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      const pts = strokeDraft.points;
+      if (pts.length === 1) {
+        ctx.beginPath();
+        ctx.arc(toX(pts[0][0]), toY(pts[0][1]), Math.max((brushSize * view.zoom) / 2, 0.5), 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.beginPath();
+        pts.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(toX(x), toY(y)) : ctx.lineTo(toX(x), toY(y))));
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // 裁剪拖框预览：框外压暗（evenodd 挖洞）+ 框线双描
+    if (cropDraft) {
+      const shape = rectFromDrag(cropDraft.ax, cropDraft.ay, cropDraft.bx, cropDraft.by);
+      const cx = view.panX + shape.x * view.zoom;
+      const cy = view.panY + shape.y * view.zoom;
+      const cw = shape.w * view.zoom;
+      const ch = shape.h * view.zoom;
+      ctx.save();
+      ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
+      ctx.beginPath();
+      ctx.rect(sx, sy, sw, sh);
+      ctx.rect(cx, cy, cw, ch);
+      ctx.fill("evenodd");
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "rgba(255,255,255,0.9)";
+      ctx.setLineDash([]);
+      ctx.strokeRect(cx - 0.5, cy - 0.5, cw + 1, ch + 1);
+      ctx.strokeStyle = "rgba(0,0,0,0.9)";
+      ctx.setLineDash([4, 3]);
+      ctx.strokeRect(cx - 0.5, cy - 0.5, cw + 1, ch + 1);
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+  }, [doc, view, viewportSize, compositeVersion, selectionEcho, marqueeDraft, lassoDraft, tool, strokeDraft, cropDraft, brushSize]);
 
   // 滚轮缩放（以光标为锚；非被动监听才能 preventDefault）
   useEffect(() => {
@@ -324,13 +406,36 @@ export function CanvasView() {
     }
   };
 
+  /** 提交笔画：一笔 = 一条历史（paint_stroke 落活动图层，受选区约束）。 */
+  const commitStroke = (draft: StrokeDraft) => {
+    const activeId = useDocsStore.getState().activeId;
+    if (activeId === null || draft.points.length === 0) return;
+    const size = useDocsStore.getState().brushSize;
+    paintStroke(activeId, {
+      points: draft.points,
+      radius: size / 2, // 前端「大小」为直径（Photoshop 惯例），Rust 收半径
+      color: foregroundColor(),
+      erase: draft.erase,
+    }).catch(reportError);
+  };
+
+  /** 提交裁剪：拖框过小按取消处理（不误裁）。 */
+  const commitCrop = (draft: MarqueeDraft) => {
+    const activeId = useDocsStore.getState().activeId;
+    if (activeId === null) return;
+    const shape = rectFromDrag(draft.ax, draft.ay, draft.bx, draft.by);
+    if (isTinyShape(shape)) return;
+    cropDoc(activeId, { x: shape.x, y: shape.y, w: shape.w, h: shape.h }).catch(reportError);
+  };
+
   const panning = tool === "hand" || spaceHeld;
   const isSelectTool = tool === "marquee-rect" || tool === "marquee-ellipse" || tool === "lasso";
+  const isPaintTool = tool === "brush" || tool === "eraser";
   const cursorStyle = dragRef.current
     ? "grabbing"
     : panning
       ? "grab"
-      : isSelectTool || tool === "eyedropper"
+      : isSelectTool || isPaintTool || tool === "crop" || tool === "eyedropper"
         ? "crosshair"
         : "default";
 
@@ -354,6 +459,16 @@ export function CanvasView() {
             } else {
               setMarqueeDraft({ ax: pt.x, ay: pt.y, bx: pt.x, by: pt.y });
             }
+          } else if (e.button === 0 && isPaintTool) {
+            const pt = toImagePos(px, py);
+            if (!pt) return;
+            e.currentTarget.setPointerCapture(e.pointerId);
+            setStrokeDraft({ points: [[pt.x, pt.y]], erase: tool === "eraser" });
+          } else if (e.button === 0 && tool === "crop") {
+            const pt = toImagePos(px, py);
+            if (!pt) return;
+            e.currentTarget.setPointerCapture(e.pointerId);
+            setCropDraft({ ax: pt.x, ay: pt.y, bx: pt.x, by: pt.y });
           } else if (e.button === 0 && tool === "eyedropper") {
             const { color } = probe(px, py);
             if (color) useDocsStore.getState().pickColor(color);
@@ -386,6 +501,26 @@ export function CanvasView() {
             }
             return;
           }
+          if (strokeDraft) {
+            // 笔画拖拽中：按屏幕 1.5px 距离采点（预览平滑 + 顶点数可控）
+            const pt = toImagePos(px, py);
+            if (!pt) return;
+            const last = strokeDraft.points[strokeDraft.points.length - 1];
+            const view = selectActiveView(useDocsStore.getState());
+            if (!view) return;
+            const dxScreen = (pt.x - last[0]) * view.zoom;
+            const dyScreen = (pt.y - last[1]) * view.zoom;
+            if (dxScreen * dxScreen + dyScreen * dyScreen >= 2.25) {
+              setStrokeDraft({ ...strokeDraft, points: [...strokeDraft.points, [pt.x, pt.y]] });
+            }
+            return;
+          }
+          if (cropDraft) {
+            const pt = toImagePos(px, py);
+            if (!pt) return;
+            setCropDraft({ ...cropDraft, bx: pt.x, by: pt.y });
+            return;
+          }
           const { point, color } = probe(px, py);
           useDocsStore.getState().setCursor(point, color);
         }}
@@ -405,12 +540,24 @@ export function CanvasView() {
             setLassoDraft(null);
             e.currentTarget.releasePointerCapture(e.pointerId);
             commitLasso(draft);
+          } else if (strokeDraft) {
+            const draft = strokeDraft;
+            setStrokeDraft(null);
+            e.currentTarget.releasePointerCapture(e.pointerId);
+            commitStroke(draft);
+          } else if (cropDraft) {
+            const draft = cropDraft;
+            setCropDraft(null);
+            e.currentTarget.releasePointerCapture(e.pointerId);
+            commitCrop(draft);
           }
         }}
         onPointerCancel={() => {
           dragRef.current = null;
           setMarqueeDraft(null);
           setLassoDraft(null);
+          setStrokeDraft(null);
+          setCropDraft(null);
         }}
         onPointerLeave={() => {
           useDocsStore.getState().setCursor(null, null);

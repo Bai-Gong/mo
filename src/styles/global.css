@@ -470,3 +470,161 @@ body {
 .top-bar__msg--error {
   color: var(--fang-color-danger);
 }
+
+/* —— 工具选项栏（M3：随工具变化，画布区顶部一条） —— */
+
+.mo-tool-options {
+  display: flex;
+  align-items: center;
+  gap: var(--fang-space-3);
+  padding: var(--fang-space-1) var(--fang-space-2);
+  border-bottom: 1px solid var(--fang-color-border);
+  font-size: var(--fang-font-size-sm);
+  color: var(--fang-color-text);
+  flex-wrap: wrap;
+}
+
+.mo-tool-options__label {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.mo-tool-options__size {
+  display: flex;
+  align-items: center;
+  gap: var(--fang-space-2);
+}
+
+.mo-tool-options__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--fang-color-border-strong);
+  border-radius: var(--fang-radius-sm);
+  background: var(--fang-color-bg-overlay);
+  color: var(--fang-color-text);
+  cursor: pointer;
+}
+
+.mo-tool-options__btn:hover:not(:disabled) {
+  background: var(--fang-color-hover);
+}
+
+.mo-tool-options__btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.mo-tool-options__value {
+  min-width: 3.5em;
+  font-variant-numeric: tabular-nums;
+  color: var(--fang-color-text-muted);
+}
+
+.mo-tool-options__color {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--fang-space-1);
+  color: var(--fang-color-text-muted);
+}
+
+.mo-tool-options__swatch {
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--fang-color-border-strong);
+  border-radius: var(--fang-radius-sm);
+}
+
+.mo-tool-options__hint {
+  color: var(--fang-color-text-muted);
+  font-size: var(--fang-font-size-xs);
+}
+
+/* —— 历史面板（M3 右停靠） —— */
+
+.mo-history {
+  display: flex;
+  flex-direction: column;
+  gap: var(--fang-space-2);
+  min-height: 0;
+}
+
+.mo-history__empty {
+  font-size: var(--fang-font-size-sm);
+  color: var(--fang-color-text-muted);
+}
+
+.mo-history__actions {
+  display: flex;
+  gap: var(--fang-space-2);
+}
+
+.mo-history__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--fang-space-1);
+  flex: 1;
+  justify-content: center;
+  padding: var(--fang-space-1) var(--fang-space-2);
+  border: 1px solid var(--fang-color-border-strong);
+  border-radius: var(--fang-radius-sm);
+  background: var(--fang-color-bg-overlay);
+  color: var(--fang-color-text);
+  font: var(--fang-font-size-sm)/1 var(--fang-font-family);
+  cursor: pointer;
+}
+
+.mo-history__btn:hover:not(:disabled) {
+  background: var(--fang-color-hover);
+}
+
+.mo-history__btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.mo-history__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.mo-history__row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: var(--fang-space-1) var(--fang-space-2);
+  border: none;
+  border-radius: var(--fang-radius-sm);
+  background: transparent;
+  color: var(--fang-color-text-muted);
+  font: var(--fang-font-size-sm)/1.4 var(--fang-font-family);
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mo-history__row:hover {
+  background: var(--fang-color-hover);
+  color: var(--fang-color-text);
+}
+
+.mo-history__row--active,
+.mo-history__row--active:hover {
+  background: var(--fang-color-accent-muted, rgba(78, 116, 207, 0.18));
+  color: var(--fang-color-text);
+  font-weight: 600;
+}
+
+.mo-history__note {
+  font-size: var(--fang-font-size-xs);
+  color: var(--fang-color-text-muted);
+}

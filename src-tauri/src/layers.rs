@@ -17,6 +17,7 @@
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
 
+use crate::history::{HistoryEntry, LayerPropState};
 use crate::imageio::{ImageDocument, LAYER_BASE_NAME};
 use crate::selection::{make_selection, select_all_mask, Selection, SelectionShape};
 use tauri::State;
@@ -45,7 +46,8 @@ impl BlendMode {
 }
 
 /// 栅格图层。像素与文档同尺寸（M2 不做位移图层/跨文档边界）。
-#[derive(Debug)]
+/// Clone 供历史条目持有（删除/裁剪需要整层快照）。
+#[derive(Debug, Clone)]
 pub struct Layer {
     pub id: u32,
     pub name: String,
@@ -112,16 +114,40 @@ impl LayerStack {
         self.layers.iter().position(|l| l.id == id)
     }
 
-    /// 摘除图层。最后一张不允许删（Photoshop 惯例：文档至少一层）。
-    pub fn remove(&mut self, id: u32) -> Result<(), String> {
+    /// 摘除图层并交还（历史条目要持有被删层）。最后一张不允许删
+    /// （Photoshop 惯例：文档至少一层）。
+    pub fn remove(&mut self, id: u32) -> Result<Layer, String> {
         let index = self
             .index_of(id)
             .ok_or_else(|| format!("图层 {id} 不存在"))?;
         if self.layers.len() <= 1 {
             return Err("文档至少保留一个图层，不能删除最后一张".into());
         }
-        self.layers.remove(index);
-        Ok(())
+        Ok(self.layers.remove(index))
+    }
+
+    /// 按 id 无条件摘除并交还（历史重放路径：撤销「新建」时栈必有 ≥2 层，
+    /// 无需再校验最后一张）。
+    pub fn remove_by_id(&mut self, id: u32) -> Option<Layer> {
+        let index = self.index_of(id)?;
+        Some(self.layers.remove(index))
+    }
+
+    /// 置顶压入一张现成图层（历史重放「新建」用；id 复用条目存的旧 id，
+    /// next_id 已单调越过它，不会冲突）。
+    pub fn push_layer(&mut self, layer: Layer) {
+        self.layers.push(layer);
+    }
+
+    /// 按栈下标原位插回（历史重放「删除」的撤销）。
+    pub fn insert_layer_at(&mut self, index: usize, layer: Layer) {
+        let index = index.min(self.layers.len());
+        self.layers.insert(index, layer);
+    }
+
+    /// 整栈替换（历史重放「裁剪」的撤销；id 均来自本栈，next_id 无需回拨）。
+    pub fn replace_all(&mut self, layers: Vec<Layer>) {
+        self.layers = layers;
     }
 
     /// 把图层 id 移到栈的 to_index（0 = 最底）。钳到合法范围。
@@ -137,7 +163,7 @@ impl LayerStack {
 }
 
 /// 前端视角的图层元信息（get_layers 契约）。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LayerInfo {
     pub id: u32,
@@ -156,7 +182,8 @@ pub struct LayersSnapshot {
     pub active_layer_id: u32,
 }
 
-fn snapshot(doc: &ImageDocument) -> LayersSnapshot {
+/// 面板快照（crate 内共用：命令与 paint.rs 的笔画命令都回它）。
+pub(crate) fn snapshot(doc: &ImageDocument) -> LayersSnapshot {
     LayersSnapshot {
         layers: doc
             .stack
@@ -193,9 +220,9 @@ fn blend_channel(cb: f32, cs: f32, mode: BlendMode) -> f32 {
     }
 }
 
-/// [0,1] → u8，半进位取整（选区蒙版同一口径，链路取整一致）。
+/// [0,1] → u8，半进位取整（选区蒙版/填充/笔画同一口径，链路取整一致）。
 #[inline]
-fn to_u8(v: f32) -> u8 {
+pub(crate) fn to_u8(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
 }
 
@@ -307,7 +334,180 @@ pub fn apply_clear_selection(doc: &mut ImageDocument) {
     doc.selection = None;
 }
 
-// —— Tauri 命令（薄壳：锁注册表 → 调上面的纯函数）——
+// —— 编辑函数（M3：改文档 + 压历史条目；命令与测试共用）——
+//
+// 命名约定：edit_* 返回 () 或 Result（业务错误），历史条目在成功变更后压入；
+// 无实际变更（同值设置/空操作）不压条目。选区命令不进历史（会话态）。
+
+/// 新建空图层（置顶并激活）。
+pub fn edit_add_layer(doc: &mut ImageDocument) {
+    let count = doc.stack.len();
+    let name = format!("图层 {count}");
+    let active_before = doc.active_layer_id;
+    let id = doc.stack.add(&name, doc.width, doc.height);
+    doc.active_layer_id = id;
+    doc.history.push(HistoryEntry::AddLayer {
+        label: "新建图层".into(),
+        layer_id: id,
+        name,
+        active_before,
+        active_after: id,
+    });
+}
+
+/// 删除图层（最后一张拒绝；删的是活动层则激活邻位顶层）。
+pub fn edit_delete_layer(doc: &mut ImageDocument, layer_id: u32) -> Result<(), String> {
+    let index = doc
+        .stack
+        .index_of(layer_id)
+        .ok_or_else(|| format!("图层 {layer_id} 不存在"))?;
+    let active_before = doc.active_layer_id;
+    let layer = doc.stack.remove(layer_id)?;
+    let active_after = if active_before == layer_id {
+        doc.stack.iter().next_back().expect("栈非空").id
+    } else {
+        active_before
+    };
+    doc.active_layer_id = active_after;
+    doc.history.push(HistoryEntry::DeleteLayer {
+        label: "删除图层".into(),
+        index,
+        layer,
+        active_before,
+        active_after,
+    });
+    Ok(())
+}
+
+/// 排序：把图层移到 to_index（0 = 最底）。无位移不压历史。
+pub fn edit_move_layer(doc: &mut ImageDocument, layer_id: u32, to_index: usize) -> Result<(), String> {
+    let from = doc
+        .stack
+        .index_of(layer_id)
+        .ok_or_else(|| format!("图层 {layer_id} 不存在"))?;
+    let to = to_index.min(doc.stack.len() - 1);
+    if from == to {
+        return Ok(()); // 目标即当前位置（钳制后），无变更
+    }
+    doc.stack.move_to(layer_id, to)?;
+    doc.history.push(HistoryEntry::MoveLayer {
+        label: "排列图层".into(),
+        layer_id,
+        from,
+        to,
+        active_before: doc.active_layer_id,
+        active_after: doc.active_layer_id,
+    });
+    Ok(())
+}
+
+/// 可见性开关。同值不压历史。
+pub fn edit_set_layer_visible(doc: &mut ImageDocument, layer_id: u32, visible: bool) -> Result<(), String> {
+    let layer = doc
+        .stack
+        .iter_mut()
+        .find(|l| l.id == layer_id)
+        .ok_or_else(|| format!("图层 {layer_id} 不存在"))?;
+    if layer.visible == visible {
+        return Ok(());
+    }
+    let before = LayerPropState::of(layer);
+    layer.visible = visible;
+    let after = LayerPropState::of(layer);
+    doc.history.push(HistoryEntry::LayerProp {
+        label: if visible { "显示图层".into() } else { "隐藏图层".into() },
+        layer_id,
+        before,
+        after,
+        active_before: doc.active_layer_id,
+        active_after: doc.active_layer_id,
+    });
+    Ok(())
+}
+
+/// 不透明度（0–1，越界钳制）。同值不压历史。
+pub fn edit_set_opacity(doc: &mut ImageDocument, layer_id: u32, opacity: f32) -> Result<(), String> {
+    let layer = doc
+        .stack
+        .iter_mut()
+        .find(|l| l.id == layer_id)
+        .ok_or_else(|| format!("图层 {layer_id} 不存在"))?;
+    let opacity = opacity.clamp(0.0, 1.0);
+    if (layer.opacity - opacity).abs() < f32::EPSILON {
+        return Ok(());
+    }
+    let before = LayerPropState::of(layer);
+    layer.opacity = opacity;
+    let after = LayerPropState::of(layer);
+    doc.history.push(HistoryEntry::LayerProp {
+        label: "图层不透明度".into(),
+        layer_id,
+        before,
+        after,
+        active_before: doc.active_layer_id,
+        active_after: doc.active_layer_id,
+    });
+    Ok(())
+}
+
+/// 混合模式。同值不压历史。
+pub fn edit_set_blend_mode(doc: &mut ImageDocument, layer_id: u32, mode: BlendMode) -> Result<(), String> {
+    let layer = doc
+        .stack
+        .iter_mut()
+        .find(|l| l.id == layer_id)
+        .ok_or_else(|| format!("图层 {layer_id} 不存在"))?;
+    if layer.blend_mode == mode {
+        return Ok(());
+    }
+    let before = LayerPropState::of(layer);
+    layer.blend_mode = mode;
+    let after = LayerPropState::of(layer);
+    doc.history.push(HistoryEntry::LayerProp {
+        label: "混合模式".into(),
+        layer_id,
+        before,
+        after,
+        active_before: doc.active_layer_id,
+        active_after: doc.active_layer_id,
+    });
+    Ok(())
+}
+
+/// 填充活动图层的选区（无选区 = 整层）并压历史（脏矩形 = 整层）。
+/// 字节未变（空选区等）不压历史。
+pub fn edit_fill(doc: &mut ImageDocument, color: [u8; 4]) -> Result<(), String> {
+    let active = doc.active_layer_id;
+    let dirty = (0, 0, doc.width, doc.height);
+    let before = doc
+        .stack
+        .iter()
+        .find(|l| l.id == active)
+        .map(|l| crate::history::read_region(&l.pixels, dirty))
+        .ok_or_else(|| format!("活动图层 {active} 不存在"))?;
+    apply_fill(doc, color)?;
+    let after = doc
+        .stack
+        .iter()
+        .find(|l| l.id == active)
+        .map(|l| crate::history::read_region(&l.pixels, dirty))
+        .expect("apply_fill 已校验活动图层存在");
+    if before == after {
+        return Ok(());
+    }
+    doc.history.push(HistoryEntry::Pixels {
+        label: "填充".into(),
+        layer_id: active,
+        dirty,
+        before,
+        after,
+        active_before: active,
+        active_after: active,
+    });
+    Ok(())
+}
+
+// —— Tauri 命令（薄壳：锁注册表 → 调上面的编辑函数）——
 
 /// 面板快照。
 #[tauri::command]
@@ -318,17 +518,36 @@ pub fn get_layers(
     documents.with_doc(doc_id, snapshot)
 }
 
+/// 编辑命令的统一返回：图层快照 + 历史快照（前端一次往返拿到一致状态，
+/// 并刷新历史面板）。尺寸供裁剪/撤销重做后校正前端文档元信息。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditResult {
+    pub layers: LayersSnapshot,
+    pub history: crate::history::HistoryInfo,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// 组装编辑返回（各命令尾部共用）。
+fn edit_result(doc: &ImageDocument) -> EditResult {
+    EditResult {
+        layers: snapshot(doc),
+        history: doc.history.info(),
+        width: doc.width,
+        height: doc.height,
+    }
+}
+
 /// 新建空图层（置顶并激活）。
 #[tauri::command]
 pub fn add_layer(
     doc_id: u32,
     documents: State<crate::imageio::Documents>,
-) -> Result<LayersSnapshot, String> {
+) -> Result<EditResult, String> {
     documents.with_doc_mut(doc_id, |doc| {
-        let count = doc.stack.len();
-        let id = doc.stack.add(&format!("图层 {count}"), doc.width, doc.height);
-        doc.active_layer_id = id;
-        snapshot(doc)
+        edit_add_layer(doc);
+        edit_result(doc)
     })
 }
 
@@ -338,13 +557,10 @@ pub fn delete_layer(
     doc_id: u32,
     layer_id: u32,
     documents: State<crate::imageio::Documents>,
-) -> Result<LayersSnapshot, String> {
+) -> Result<EditResult, String> {
     documents.with_doc_mut(doc_id, |doc| {
-        doc.stack.remove(layer_id)?;
-        if doc.active_layer_id == layer_id {
-            doc.active_layer_id = doc.stack.iter().next_back().expect("栈非空").id;
-        }
-        Ok(snapshot(doc))
+        edit_delete_layer(doc, layer_id)?;
+        Ok(edit_result(doc))
     })?
 }
 
@@ -355,10 +571,10 @@ pub fn move_layer(
     layer_id: u32,
     to_index: u32,
     documents: State<crate::imageio::Documents>,
-) -> Result<LayersSnapshot, String> {
+) -> Result<EditResult, String> {
     documents.with_doc_mut(doc_id, |doc| {
-        doc.stack.move_to(layer_id, to_index as usize)?;
-        Ok(snapshot(doc))
+        edit_move_layer(doc, layer_id, to_index as usize)?;
+        Ok(edit_result(doc))
     })?
 }
 
@@ -369,15 +585,10 @@ pub fn set_layer_visible(
     layer_id: u32,
     visible: bool,
     documents: State<crate::imageio::Documents>,
-) -> Result<LayersSnapshot, String> {
+) -> Result<EditResult, String> {
     documents.with_doc_mut(doc_id, |doc| {
-        let layer = doc
-            .stack
-            .iter_mut()
-            .find(|l| l.id == layer_id)
-            .ok_or_else(|| format!("图层 {layer_id} 不存在"))?;
-        layer.visible = visible;
-        Ok(snapshot(doc))
+        edit_set_layer_visible(doc, layer_id, visible)?;
+        Ok(edit_result(doc))
     })?
 }
 
@@ -388,15 +599,10 @@ pub fn set_layer_opacity(
     layer_id: u32,
     opacity: f32,
     documents: State<crate::imageio::Documents>,
-) -> Result<LayersSnapshot, String> {
+) -> Result<EditResult, String> {
     documents.with_doc_mut(doc_id, |doc| {
-        let layer = doc
-            .stack
-            .iter_mut()
-            .find(|l| l.id == layer_id)
-            .ok_or_else(|| format!("图层 {layer_id} 不存在"))?;
-        layer.opacity = opacity.clamp(0.0, 1.0);
-        Ok(snapshot(doc))
+        edit_set_opacity(doc, layer_id, opacity)?;
+        Ok(edit_result(doc))
     })?
 }
 
@@ -407,20 +613,15 @@ pub fn set_layer_blend_mode(
     layer_id: u32,
     mode: String,
     documents: State<crate::imageio::Documents>,
-) -> Result<LayersSnapshot, String> {
+) -> Result<EditResult, String> {
     let mode = BlendMode::parse(&mode)?;
     documents.with_doc_mut(doc_id, |doc| {
-        let layer = doc
-            .stack
-            .iter_mut()
-            .find(|l| l.id == layer_id)
-            .ok_or_else(|| format!("图层 {layer_id} 不存在"))?;
-        layer.blend_mode = mode;
-        Ok(snapshot(doc))
+        edit_set_blend_mode(doc, layer_id, mode)?;
+        Ok(edit_result(doc))
     })?
 }
 
-/// 设活动图层（填充的落点）。
+/// 设活动图层（笔画/填充的落点）。会话态，不进历史。
 #[tauri::command]
 pub fn set_active_layer(
     doc_id: u32,
@@ -437,6 +638,7 @@ pub fn set_active_layer(
 }
 
 /// 设置选区（矩形/椭圆/套索，浮点几何，Rust 栅格化为抗锯齿蒙版）。
+/// 选区是会话态，不进历史（Photoshop 同惯例）。
 #[tauri::command]
 pub fn set_selection(
     doc_id: u32,
@@ -470,10 +672,10 @@ pub fn fill_active_layer(
     doc_id: u32,
     color: [u8; 4],
     documents: State<crate::imageio::Documents>,
-) -> Result<(), String> {
+) -> Result<EditResult, String> {
     documents.with_doc_mut(doc_id, |doc| {
-        apply_fill(doc, color)?;
-        Ok(())
+        edit_fill(doc, color)?;
+        Ok(edit_result(doc))
     })?
 }
 

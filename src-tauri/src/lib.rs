@@ -1,10 +1,13 @@
 // 百工·墨（Mo）：以图层为中心的位图编辑工具。
 // M0 骨架：空窗口外壳 + app_info 命令；M1：图像管线（imageio.rs——打开/像素/另存/关闭，
 // 选型定案见 docs/图像库选型.md）；M2：图层栈与合成（layers.rs）、选区栅格化
-// （selection.rs）——文档模型升级为图层栈，get_pixels/另存返回合成结果。
+// （selection.rs）；M3：画笔/橡皮/裁剪（paint.rs）与命令式历史栈（history.rs，
+// 撤销重做覆盖图像内容与图层结构两类操作）。
 
+mod history;
 mod imageio;
 mod layers;
+mod paint;
 mod selection;
 
 use serde::Serialize;
@@ -37,6 +40,11 @@ pub fn run() {
             imageio::get_pixels,
             imageio::save_document,
             imageio::close_document,
+            imageio::crop_document,
+            imageio::undo,
+            imageio::redo,
+            imageio::history_jump,
+            imageio::get_history,
             layers::get_layers,
             layers::add_layer,
             layers::delete_layer,
@@ -49,6 +57,7 @@ pub fn run() {
             layers::select_all,
             layers::deselect,
             layers::fill_active_layer,
+            paint::paint_stroke,
         ])
         .run(tauri::generate_context!())
         .expect("error while running mo");

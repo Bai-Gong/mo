@@ -2,10 +2,11 @@
  * 应用标题栏：坊 TitleBar（菜单栏＋窗口三键＋拖动区）＋墨的文件/编辑/查看动作。
  *
  * 菜单：文件＝新建 / 打开… / 另存为 PNG… / 另存为 JPEG… / 关闭标签 / 退出；
- * 编辑（M2）＝全选 / 取消选择 / 填充选区（前景色，取吸管取到的颜色，默认黑）；
- * 视图＝适合窗口 / 实际像素 / 放大 / 缩小；帮助＝关于。
+ * 编辑（M2）＝全选 / 取消选择 / 填充选区；（M3）＝撤销 / 重做（图像内容与
+ * 图层结构同栈）；视图＝适合窗口 / 实际像素 / 放大 / 缩小；帮助＝关于。
  * 快捷键经坊 useHotkeys 挂窗口级（Ctrl+N / Ctrl+O / Ctrl+Shift+S / Ctrl+W /
- * Ctrl+A / Ctrl+D / Alt+Backspace / Ctrl+0 / Ctrl+1 / Ctrl+= / Ctrl+-）。
+ * Ctrl+A / Ctrl+D / Alt+Backspace / Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y /
+ * Ctrl+0 / Ctrl+1 / Ctrl+= / Ctrl+-）。
  */
 import { useCallback, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -20,7 +21,13 @@ import {
   openImagePath,
   saveDocAs,
 } from "../core/document/openPipeline";
-import { deselect, fillSelection, selectAll } from "../core/document/layerPipeline";
+import {
+  deselect,
+  fillSelection,
+  redo,
+  selectAll,
+  undo,
+} from "../core/document/layerPipeline";
 
 const ZOOM_STEP = Math.sqrt(2); // 每次约 141%（两步翻倍），Photoshop 惯例量级
 
@@ -108,6 +115,27 @@ export function AppTitleBar() {
     }
   }, [notify]);
 
+  /** 编辑→撤销/重做（M3：图像内容与图层结构同一条历史栈）。 */
+  const onUndo = useCallback(async () => {
+    const id = useDocsStore.getState().activeId;
+    if (id === null) return;
+    try {
+      await undo(id);
+    } catch (err) {
+      notify("error", `撤销失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [notify]);
+
+  const onRedo = useCallback(async () => {
+    const id = useDocsStore.getState().activeId;
+    if (id === null) return;
+    try {
+      await redo(id);
+    } catch (err) {
+      notify("error", `重做失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [notify]);
+
   /** 文件→另存为…：Rust 侧从驻留像素编码（含 ICC 原样写回）。 */
   const onSaveAs = useCallback(
     async (format: "png" | "jpeg") => {
@@ -154,6 +182,17 @@ export function AppTitleBar() {
     }
   }, [notify]);
 
+  const canUndo = useDocsStore((s) => {
+    if (s.activeId === null) return false;
+    const h = s.history[s.activeId];
+    return h !== null && h !== undefined && h.index > 0;
+  });
+  const canRedo = useDocsStore((s) => {
+    if (s.activeId === null) return false;
+    const h = s.history[s.activeId];
+    return h !== null && h !== undefined && h.index < h.entries.length;
+  });
+
   const menus = useMemo<MenuEntry[]>(
     () => [
       {
@@ -190,6 +229,21 @@ export function AppTitleBar() {
       {
         label: "编辑",
         items: [
+          {
+            kind: "item",
+            label: "撤销",
+            hint: "Ctrl+Z",
+            disabled: !canUndo,
+            onSelect: () => void onUndo(),
+          },
+          {
+            kind: "item",
+            label: "重做",
+            hint: "Ctrl+Shift+Z",
+            disabled: !canRedo,
+            onSelect: () => void onRedo(),
+          },
+          { kind: "separator" },
           {
             kind: "item",
             label: "全选",
@@ -256,7 +310,21 @@ export function AppTitleBar() {
       },
       { label: "帮助", items: [{ kind: "item", label: "关于 百工·墨", onSelect: () => void onAbout() }] },
     ],
-    [hasDoc, onNew, onOpen, onSaveAs, onCloseTab, onSelectAll, onDeselect, onFill, onAbout],
+    [
+      hasDoc,
+      canUndo,
+      canRedo,
+      onNew,
+      onOpen,
+      onSaveAs,
+      onCloseTab,
+      onUndo,
+      onRedo,
+      onSelectAll,
+      onDeselect,
+      onFill,
+      onAbout,
+    ],
   );
 
   useHotkeys({
@@ -267,6 +335,9 @@ export function AppTitleBar() {
     "Ctrl+A": () => void onSelectAll(),
     "Ctrl+D": () => void onDeselect(),
     "Alt+Backspace": () => void onFill(),
+    "Ctrl+Shift+Z": () => void onRedo(),
+    "Ctrl+Y": () => void onRedo(),
+    "Ctrl+Z": () => void onUndo(),
     "Ctrl+0": () => useDocsStore.getState().fitActive(),
     "Ctrl+1": () => useDocsStore.getState().actualSizeActive(),
     "Ctrl+=": () => {

@@ -8,11 +8,13 @@
  */
 import { beforeEach, describe, expect, it } from "vitest";
 import type { EditResult, LayerIo, LayersSnapshot } from "./layerIo";
-import type { HistoryMeta, LayerMeta, StrokeParams } from "./types";
+import type { HistoryMeta, LayerMeta, StrokeParams, TextSpec } from "./types";
 import type { SelectionShape } from "../canvas/selection";
 import {
   activateLayer,
+  addAdjustmentLayer,
   addLayer,
+  addTextLayer,
   commitSelection,
   cropDoc,
   deleteLayer,
@@ -24,9 +26,11 @@ import {
   redo,
   refreshHistory,
   selectAll,
+  setAdjustmentParams,
   setLayerBlendMode,
   setLayerOpacity,
   setLayerVisible,
+  setTextLayer,
   undo,
 } from "./layerPipeline";
 import { useDocsStore } from "./store";
@@ -34,7 +38,7 @@ import { clearPixelStore, getPixels, setPixels } from "./pixelStore";
 import type { ImageDocMeta } from "./types";
 
 function layer(id: number, name: string, over: Partial<LayerMeta> = {}): LayerMeta {
-  return { id, name, visible: true, opacity: 1, blendMode: "normal", ...over };
+  return { id, name, visible: true, opacity: 1, blendMode: "normal", kind: { kind: "raster" }, ...over };
 }
 
 function snap(layers: LayerMeta[], activeLayerId: number): LayersSnapshot {
@@ -104,6 +108,17 @@ function makeLayerIo(script: {
     fillActiveLayer: (docId, color) => mutating("fill_active_layer", { docId, color }),
     paintStroke: (docId, stroke) => mutating("paint_stroke", { docId, stroke }),
     cropDocument: (docId, rect) => mutating("crop_document", { docId, rect }),
+    addAdjustmentLayer: (docId, adjustment) =>
+      mutating("add_adjustment_layer", { docId, adjustment }),
+    setAdjustmentParams: (docId, layerId, adjustment) =>
+      mutating("set_adjustment_params", { docId, layerId, adjustment }),
+    addTextLayer: (docId, spec) => mutating("add_text_layer", { docId, spec }),
+    setTextLayer: (docId, layerId, spec) =>
+      mutating("set_text_layer", { docId, layerId, spec }),
+    async fontFamilies() {
+      calls.push({ kind: "font_families", arg: null });
+      return ["微软雅黑"];
+    },
     undo: (docId) => mutating("undo", docId),
     redo: (docId) => mutating("redo", docId),
     historyJump: (docId, target) => mutating("history_jump", { docId, target }),
@@ -145,6 +160,8 @@ function resetAll() {
     history: {},
     tool: "hand",
     brushSize: 8,
+    textFamily: "微软雅黑",
+    textSize: 32,
     cursor: null,
     hoverColor: null,
     pickedColor: null,
@@ -467,5 +484,85 @@ describe("M3 准入场景（编排层）：从零画图 → 撤销 → 重做 �
 
     // 每次内容变化都重拉合成（画布随之刷新）
     expect(useDocsStore.getState().compositeVersion[1]).toBe(7);
+  });
+});
+
+describe("M4 调整与文字编排", () => {
+  const adjustLayer = (
+    id: number,
+    name: string,
+    adjustment: import("./types").AdjustmentSpec,
+    over: Partial<LayerMeta> = {},
+  ): LayerMeta => layer(id, name, { kind: { kind: "adjustment", adjustment }, ...over });
+
+  it("新建调整图层：参数下传 + 快照/历史落位 + 合成重拉（调整改变合成）", async () => {
+    openDoc(1);
+    const adjustment = { type: "hue", degrees: 30 } as const;
+    const { io, calls } = makeLayerIo({
+      results: [
+        edit(
+          snap([layer(1, "背景"), adjustLayer(2, "色相调整", adjustment)], 2),
+          { entries: ["新建调整图层"], index: 1 },
+        ),
+      ],
+      pixelsFor: () => new Uint8ClampedArray(8 * 6 * 4),
+    });
+    await addAdjustmentLayer(1, adjustment, io);
+
+    const s = useDocsStore.getState();
+    expect(s.layers[1]).toHaveLength(2);
+    expect(s.layers[1]?.[1]?.kind).toEqual({ kind: "adjustment", adjustment });
+    expect(s.activeLayerId[1]).toBe(2);
+    expect(s.history[1]?.index).toBe(1);
+    expect(s.compositeVersion[1]).toBe(1); // 调整层改变合成 → 重拉
+    expect(calls).toContainEqual({ kind: "add_adjustment_layer", arg: { docId: 1, adjustment } });
+  });
+
+  it("改调整参数：layerId + 参数下传，合成重拉", async () => {
+    openDoc(1);
+    const { io, calls } = makeLayerIo({
+      results: [edit(snap([layer(1, "背景")], 1), { entries: ["亮度参数"], index: 1 })],
+      pixelsFor: () => new Uint8ClampedArray(8 * 6 * 4),
+    });
+    await setAdjustmentParams(1, 3, { type: "brightness", amount: 0.2 }, io);
+    expect(calls).toContainEqual({
+      kind: "set_adjustment_params",
+      arg: { docId: 1, layerId: 3, adjustment: { type: "brightness", amount: 0.2 } },
+    });
+    expect(useDocsStore.getState().compositeVersion[1]).toBe(1);
+    expect(useDocsStore.getState().history[1]?.entries).toEqual(["亮度参数"]);
+  });
+
+  it("新建/编辑文字图层：spec 下传、激活返回、合成重拉", async () => {
+    openDoc(1);
+    const spec: TextSpec = {
+      text: "百工·墨",
+      family: "黑体",
+      size: 32,
+      color: [255, 255, 255, 255],
+      x: 12,
+      y: 40,
+    };
+    const edited: TextSpec = { ...spec, text: "墨" };
+    const textLayer = (id: number, s: TextSpec): LayerMeta =>
+      layer(id, `文字：${s.text}`, { kind: { kind: "text", spec: s } });
+    const { io, calls } = makeLayerIo({
+      results: [
+        edit(snap([layer(1, "背景"), textLayer(2, spec)], 2), { entries: ["新建文字图层"], index: 1 }),
+        edit(snap([layer(1, "背景"), textLayer(2, edited)], 2), { entries: ["新建文字图层", "编辑文字"], index: 2 }),
+      ],
+      pixelsFor: () => new Uint8ClampedArray(8 * 6 * 4),
+    });
+
+    const activeId = await addTextLayer(1, spec, io);
+    expect(activeId).toBe(2);
+    expect(useDocsStore.getState().layers[1]?.[1]?.kind).toEqual({ kind: "text", spec });
+
+    await setTextLayer(1, 2, edited, io);
+    expect(useDocsStore.getState().layers[1]?.[1]?.kind).toEqual({ kind: "text", spec: edited });
+    expect(useDocsStore.getState().history[1]?.index).toBe(2);
+    expect(calls).toContainEqual({ kind: "add_text_layer", arg: { docId: 1, spec } });
+    expect(calls).toContainEqual({ kind: "set_text_layer", arg: { docId: 1, layerId: 2, spec: edited } });
+    expect(useDocsStore.getState().compositeVersion[1]).toBe(2);
   });
 });

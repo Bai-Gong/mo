@@ -1,5 +1,7 @@
 //! M2 图层栈与合成：栅格图层（与文档同尺寸 RGBA8）的增删/排序/可见性、
 //! 不透明度与混合模式、自底向上合成、选区约束填充。
+//! M4 起图层分三种（`LayerKind`）：栅格 / 调整（非破坏，见 adjustments.rs）/
+//! 文字（参数为源、栅格缓存进合成，见 text.rs）。
 //!
 //! 合成公式取 W3C《Compositing and Blending Level 1》（Photoshop 同源），
 //! 非预乘通道参与运算：
@@ -10,6 +12,8 @@
 //! 其中图层不透明度直接缩放 αs；B 为混合函数（normal/multiply/screen/overlay）。
 //! overlay 按 W3C 定义对**底色**分支：Cb ≤ 0.5 走 2·Cb·Cs（乘性），否则走
 //! 1−2(1−Cb)(1−Cs)（屏性）。
+//! 调整图层不引入新像素：对累积缓冲（其下所有层的合成结果）就地运算，
+//! 图层不透明度 = 原值与调整值的混合系数；混合模式对调整层无意义（不参与）。
 //!
 //! 性能口径：M2 顺序合成（每层一趟 w×h 循环），海报量级毫秒级；真出现大图
 //! 帧预算问题时再上 rayon 分行（image 已带 rayon feature，选型文档已留档）。
@@ -17,12 +21,14 @@
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
 
+use crate::adjustments::Adjustment;
 use crate::history::{HistoryEntry, LayerPropState};
 use crate::imageio::{ImageDocument, LAYER_BASE_NAME};
 use crate::selection::{make_selection, select_all_mask, Selection, SelectionShape};
+use crate::text::TextSpec;
 use tauri::State;
 
-/// M2 混合模式集（前端传小写名，serde camelCase）。
+/// M4 混合模式集（前端传小写名，serde camelCase）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BlendMode {
@@ -45,13 +51,25 @@ impl BlendMode {
     }
 }
 
-/// 栅格图层。像素与文档同尺寸（M2 不做位移图层/跨文档边界）。
+/// 图层种类（M4）：
+/// - `Raster`：`pixels` 即事实源（画笔/填充/打开文件的背景层）；
+/// - `Adjustment`：非破坏调整参数（`pixels` 恒为 0×0 空图，不占内存）；
+/// - `Text`：文字参数为事实源，`pixels` 为随内容再栅格化的缓存（文档同尺寸）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum LayerKind {
+    Raster,
+    Adjustment(Adjustment),
+    Text(TextSpec),
+}
+
+/// 图层。栅格/文字层像素与文档同尺寸（M2 不做位移图层/跨文档边界）；
 /// Clone 供历史条目持有（删除/裁剪需要整层快照）。
 #[derive(Debug, Clone)]
 pub struct Layer {
     pub id: u32,
     pub name: String,
     pub pixels: RgbaImage,
+    pub kind: LayerKind,
     pub visible: bool,
     /// 0.0–1.0（UI 显示为百分比）。
     pub opacity: f32,
@@ -73,6 +91,7 @@ impl LayerStack {
             id: stack.next_id + 1,
             name: LAYER_BASE_NAME.into(),
             pixels,
+            kind: LayerKind::Raster,
             visible: true,
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
@@ -83,12 +102,24 @@ impl LayerStack {
 
     /// 顶层加一张空（全透明）图层，返回其 id（像素修改经 `iter_mut` 按 id 定位）。
     pub fn add(&mut self, name: &str, width: u32, height: u32) -> u32 {
+        self.add_kind(name, LayerKind::Raster, width, height)
+    }
+
+    /// 顶层加一张指定种类的图层（栅格 = 空图层；调整 = 0×0 空像素；文字 =
+    /// 0×0 占位，由调用方栅格化后替换 `pixels`），返回其 id。
+    pub fn add_kind(&mut self, name: &str, kind: LayerKind, width: u32, height: u32) -> u32 {
         self.next_id += 1;
         let id = self.next_id;
+        let pixels = match kind {
+            // 调整层不占像素内存；文字层的像素由调用方栅格化替换（先占位）
+            LayerKind::Adjustment(_) | LayerKind::Text(_) => RgbaImage::new(0, 0),
+            LayerKind::Raster => RgbaImage::new(width, height),
+        };
         self.layers.push(Layer {
             id,
             name: name.into(),
-            pixels: RgbaImage::new(width, height),
+            pixels,
+            kind,
             visible: true,
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
@@ -162,6 +193,43 @@ impl LayerStack {
     }
 }
 
+/// 整层随文档裁剪（裁剪命令与历史重放共用；纯几何，确定性）：
+/// - 像素：栅格/文字层裁矩形；调整层无像素，按新文档尺寸开空图；
+/// - 文字层**事实源坐标同步平移** −(x, y)：TextSpec 的基线端点是文档坐标系
+///   下的参数，裁剪改变文档坐标系后若不随移，后续任何编辑（改字号/颜色/文本）
+///   按旧坐标重栅格化就会错位或整段出画布（M4 评审修复的裁剪×文字组合漏洞）。
+///   撤销裁剪恢复整栈快照（含原坐标），无需另存。
+pub(crate) fn crop_layer(layer: &mut Layer, x: u32, y: u32, w: u32, h: u32) {
+    if let LayerKind::Text(spec) = &mut layer.kind {
+        spec.x -= x as f32;
+        spec.y -= y as f32;
+    }
+    layer.pixels = match layer.kind {
+        LayerKind::Adjustment(_) => RgbaImage::new(w, h),
+        _ => image::imageops::crop_imm(&layer.pixels, x, y, w, h).to_image(),
+    };
+}
+
+/// 前端视角的图层种类（serde tag=kind，camelCase）。调整层带回传参数
+/// （面板编辑用），文字层带回传内容（选项栏编辑用）。
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum LayerKindInfo {
+    Raster,
+    Adjustment { adjustment: Adjustment },
+    Text { spec: TextSpec },
+}
+
+impl From<&LayerKind> for LayerKindInfo {
+    fn from(kind: &LayerKind) -> Self {
+        match kind {
+            LayerKind::Raster => LayerKindInfo::Raster,
+            LayerKind::Adjustment(a) => LayerKindInfo::Adjustment { adjustment: a.clone() },
+            LayerKind::Text(spec) => LayerKindInfo::Text { spec: spec.clone() },
+        }
+    }
+}
+
 /// 前端视角的图层元信息（get_layers 契约）。
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -171,6 +239,7 @@ pub struct LayerInfo {
     pub visible: bool,
     pub opacity: f32,
     pub blend_mode: BlendMode,
+    pub kind: LayerKindInfo,
 }
 
 /// 图层面板一次拉取的完整快照（每次图层操作后的返回，保持两端一致）。
@@ -194,6 +263,7 @@ pub(crate) fn snapshot(doc: &ImageDocument) -> LayersSnapshot {
                 visible: l.visible,
                 opacity: l.opacity,
                 blend_mode: l.blend_mode,
+                kind: LayerKindInfo::from(&l.kind),
             })
             .collect(),
         active_layer_id: doc.active_layer_id,
@@ -261,10 +331,18 @@ fn blend_onto(acc: &mut [u8], src: &RgbaImage, opacity: f32, mode: BlendMode) {
 }
 
 /// 合成整栈（跳过隐藏/全透明的层），自底向上。空栈 → 全透明。
+/// 调整层不引入像素：对其下累积结果就地运算（不透明度 = 调整强度系数）。
 pub fn composite(stack: &LayerStack, width: u32, height: u32) -> RgbaImage {
     let mut acc = vec![0u8; width as usize * height as usize * 4];
     for layer in stack.iter().filter(|l| l.visible && l.opacity > 0.0) {
-        blend_onto(&mut acc, &layer.pixels, layer.opacity, layer.blend_mode);
+        match &layer.kind {
+            LayerKind::Raster | LayerKind::Text(_) => {
+                blend_onto(&mut acc, &layer.pixels, layer.opacity, layer.blend_mode);
+            }
+            LayerKind::Adjustment(adjustment) => {
+                adjustment.apply_to(&mut acc, layer.opacity);
+            }
+        }
     }
     RgbaImage::from_raw(width, height, acc).expect("累积缓冲与文档同尺寸")
 }
@@ -302,7 +380,8 @@ pub fn fill_layer(layer: &mut RgbaImage, selection: Option<&Selection>, color: [
     }
 }
 
-/// 文档级填充入口（命令与测试共用）：填充活动图层。
+/// 文档级填充入口（命令与测试共用）：填充活动图层（仅栅格层——文字层
+/// 内容会被重栅格化覆盖、调整层无像素，Photoshop 同样不允许直接画）。
 pub fn apply_fill(doc: &mut ImageDocument, color: [u8; 4]) -> Result<(), String> {
     let active = doc.active_layer_id;
     let layer = doc
@@ -310,8 +389,138 @@ pub fn apply_fill(doc: &mut ImageDocument, color: [u8; 4]) -> Result<(), String>
         .iter_mut()
         .find(|l| l.id == active)
         .ok_or_else(|| format!("活动图层 {active} 不存在"))?;
+    if !matches!(layer.kind, LayerKind::Raster) {
+        return Err("只能填充栅格图层（文字/调整图层不可直接绘制）".into());
+    }
     fill_layer(&mut layer.pixels, doc.selection.as_ref(), color);
     Ok(())
+}
+
+// —— M4 编辑函数：调整图层（非破坏）与文字图层 ——
+
+/// 新建调整图层（置顶激活；参数经 normalize 归一）。不碰任何下层像素。
+pub fn edit_add_adjustment(doc: &mut ImageDocument, adjustment: Adjustment) -> Result<(), String> {
+    let adjustment = adjustment.normalize()?;
+    let name = format!("{}调整", adjustment.kind_name());
+    let active_before = doc.active_layer_id;
+    let id = doc.stack.add_kind(&name, LayerKind::Adjustment(adjustment.clone()), doc.width, doc.height);
+    doc.active_layer_id = id;
+    doc.history.push(HistoryEntry::AddAdjustmentLayer {
+        label: "新建调整图层".into(),
+        layer_id: id,
+        name,
+        adjustment,
+        active_before,
+        active_after: id,
+    });
+    Ok(())
+}
+
+/// 改调整图层的参数（同值不压历史；参数变更即时反映在合成，不动下层像素）。
+pub fn edit_set_adjustment(
+    doc: &mut ImageDocument,
+    layer_id: u32,
+    adjustment: Adjustment,
+) -> Result<(), String> {
+    let adjustment = adjustment.normalize()?;
+    let layer = doc
+        .stack
+        .iter_mut()
+        .find(|l| l.id == layer_id)
+        .ok_or_else(|| format!("图层 {layer_id} 不存在"))?;
+    match &layer.kind {
+        LayerKind::Adjustment(current) if *current == adjustment => Ok(()),
+        LayerKind::Adjustment(current) => {
+            let before = current.clone();
+            let label = format!("{}参数", adjustment.kind_name());
+            layer.kind = LayerKind::Adjustment(adjustment.clone());
+            doc.history.push(HistoryEntry::AdjustmentParams {
+                label,
+                layer_id,
+                before,
+                after: adjustment,
+                active_before: doc.active_layer_id,
+                active_after: doc.active_layer_id,
+            });
+            Ok(())
+        }
+        _ => Err(format!("图层 {layer_id} 不是调整图层，不能设置调整参数")),
+    }
+}
+
+/// 新建文字图层（置顶激活；内容即时栅格化进像素缓存）。
+/// 字体不可用 → Err（文档保持未变更）。
+pub fn edit_add_text(doc: &mut ImageDocument, spec: TextSpec) -> Result<(), String> {
+    // 先栅格化再入栈：失败时文档保持原状
+    let pixels = crate::text::rasterize_text(&spec, doc.width, doc.height)?;
+    let name = text_layer_name(&spec);
+    let active_before = doc.active_layer_id;
+    let id = doc.stack.add_kind(&name, LayerKind::Text(spec.clone()), doc.width, doc.height);
+    if let Some(layer) = doc.stack.iter_mut().find(|l| l.id == id) {
+        layer.pixels = pixels;
+    }
+    doc.active_layer_id = id;
+    doc.history.push(HistoryEntry::AddTextLayer {
+        label: "新建文字图层".into(),
+        layer_id: id,
+        name,
+        spec,
+        active_before,
+        active_after: id,
+    });
+    Ok(())
+}
+
+/// 改文字图层内容（同值不压历史；换内容即重栅格化，位置/字体/字号/颜色同改）。
+pub fn edit_set_text(
+    doc: &mut ImageDocument,
+    layer_id: u32,
+    spec: TextSpec,
+) -> Result<(), String> {
+    let (width, height) = (doc.width, doc.height);
+    let layer = doc
+        .stack
+        .iter_mut()
+        .find(|l| l.id == layer_id)
+        .ok_or_else(|| format!("图层 {layer_id} 不存在"))?;
+    match &layer.kind {
+        LayerKind::Text(current) if *current == spec => Ok(()),
+        LayerKind::Text(current) => {
+            let before = current.clone();
+            // 先栅格化再改层：字体失败时层保持原状
+            let pixels = crate::text::rasterize_text(&spec, width, height)?;
+            layer.kind = LayerKind::Text(spec.clone());
+            layer.pixels = pixels;
+            doc.history.push(HistoryEntry::EditText {
+                label: "编辑文字".into(),
+                layer_id,
+                before,
+                after: spec,
+                active_before: doc.active_layer_id,
+                active_after: doc.active_layer_id,
+            });
+            Ok(())
+        }
+        _ => Err(format!("图层 {layer_id} 不是文字图层，不能设置文本内容")),
+    }
+}
+
+/// 文字图层名：内容首行的前 8 个字符（空文本叫「文字」）。
+fn text_layer_name(spec: &TextSpec) -> String {
+    let first = spec.text.split('\n').next().unwrap_or("").trim();
+    if first.is_empty() {
+        "文字".into()
+    } else {
+        let name: String = first.chars().take(8).collect();
+        format!("文字：{name}")
+    }
+}
+
+/// 文字层像素随内容再栅格化（编辑与历史重放共用；字体缺失退空图——重放
+/// 只求状态一致，不再向上抛错）。
+pub(crate) fn rasterize_text_pixels(spec: &TextSpec, width: u32, height: u32) -> RgbaImage {
+    crate::text::rasterize_text(spec, width, height)
+        .unwrap_or_else(|_| RgbaImage::new(width, height))
 }
 
 // —— 选区操作（文档级）——
@@ -475,9 +684,14 @@ pub fn edit_set_blend_mode(doc: &mut ImageDocument, layer_id: u32, mode: BlendMo
 }
 
 /// 填充活动图层的选区（无选区 = 整层）并压历史（脏矩形 = 整层）。
-/// 字节未变（空选区等）不压历史。
+/// 字节未变（空选区等）不压历史。仅栅格层可填充（M4）。
 pub fn edit_fill(doc: &mut ImageDocument, color: [u8; 4]) -> Result<(), String> {
     let active = doc.active_layer_id;
+    if let Some(layer) = doc.stack.iter().find(|l| l.id == active) {
+        if !matches!(layer.kind, LayerKind::Raster) {
+            return Err("只能填充栅格图层（文字/调整图层不可直接绘制）".into());
+        }
+    }
     let dirty = (0, 0, doc.width, doc.height);
     let before = doc
         .stack
@@ -679,6 +893,68 @@ pub fn fill_active_layer(
     })?
 }
 
+// —— M4 Tauri 命令：调整图层 / 文字图层 ——
+
+/// 新建调整图层（置顶激活；adjustment 为 tag=type 的参数对象）。
+#[tauri::command]
+pub fn add_adjustment_layer(
+    doc_id: u32,
+    adjustment: Adjustment,
+    documents: State<crate::imageio::Documents>,
+) -> Result<EditResult, String> {
+    documents.with_doc_mut(doc_id, |doc| {
+        edit_add_adjustment(doc, adjustment)?;
+        Ok(edit_result(doc))
+    })?
+}
+
+/// 改调整图层的参数（即时反映在合成）。
+#[tauri::command]
+pub fn set_adjustment_params(
+    doc_id: u32,
+    layer_id: u32,
+    adjustment: Adjustment,
+    documents: State<crate::imageio::Documents>,
+) -> Result<EditResult, String> {
+    documents.with_doc_mut(doc_id, |doc| {
+        edit_set_adjustment(doc, layer_id, adjustment)?;
+        Ok(edit_result(doc))
+    })?
+}
+
+/// 新建文字图层（内容即时栅格化；字体不可用返回可读错误）。
+#[tauri::command]
+pub fn add_text_layer(
+    doc_id: u32,
+    spec: TextSpec,
+    documents: State<crate::imageio::Documents>,
+) -> Result<EditResult, String> {
+    documents.with_doc_mut(doc_id, |doc| {
+        edit_add_text(doc, spec)?;
+        Ok(edit_result(doc))
+    })?
+}
+
+/// 改文字图层内容（文本/字体/字号/颜色/位置，换内容即重栅格化）。
+#[tauri::command]
+pub fn set_text_layer(
+    doc_id: u32,
+    layer_id: u32,
+    spec: TextSpec,
+    documents: State<crate::imageio::Documents>,
+) -> Result<EditResult, String> {
+    documents.with_doc_mut(doc_id, |doc| {
+        edit_set_text(doc, layer_id, spec)?;
+        Ok(edit_result(doc))
+    })?
+}
+
+/// 本机可用字体族（文字工具下拉选项；探测候选表返回实际存在的族）。
+#[tauri::command]
+pub fn font_families() -> Vec<String> {
+    crate::text::available_families().into_iter().map(String::from).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,6 +965,7 @@ mod tests {
             id: 0,
             name: "测试".into(),
             pixels: RgbaImage::from_pixel(4, 4, image::Rgba(color)),
+            kind: LayerKind::Raster,
             visible: true,
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
@@ -884,5 +1161,219 @@ mod tests {
         fill_layer(&mut layer, None, [0, 0, 0, 128]);
         let px = layer.get_pixel(1, 1).0;
         assert_close(px, [128, 128, 128, 255], 1, "半透明黑盖白应为中灰");
+    }
+
+    // —— M4 调整图层（非破坏语义） ——
+
+    use crate::adjustments::Adjustment;
+    use crate::imageio::new_document;
+
+    /// 白底 + 红层（顶）的 8×8 文档。
+    fn doc_two_raster() -> crate::imageio::ImageDocument {
+        let mut doc = new_document(8, 8, Some([255, 255, 255, 255])).expect("新建");
+        let red = doc.stack.add("红", 8, 8);
+        doc.active_layer_id = red;
+        apply_fill(&mut doc, [255, 0, 0, 255]).expect("填红");
+        doc
+    }
+
+    #[test]
+    fn 调整图层_只影响其下层级_上层不受影响() {
+        let mut doc = doc_two_raster();
+        // 栈顶再放一张蓝色栅格层（在调整层之上）
+        let blue = doc.stack.add("蓝", 8, 8);
+        doc.active_layer_id = blue;
+        apply_fill(&mut doc, [0, 0, 255, 255]).expect("填蓝");
+        // 在红层与蓝层之间插调整层：用「红层上放调整」不如直接构造——
+        // 编辑函数只往栈顶加，这里手动组装：底白/中红/调亮/顶蓝
+        let mut stack = LayerStack::with_base(RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255])));
+        stack.add("红", 4, 4); // 占位，直接覆像素
+        stack.layers[1].pixels = RgbaImage::from_pixel(4, 4, image::Rgba([100, 100, 100, 255]));
+        stack.add_kind("亮度", LayerKind::Adjustment(Adjustment::Brightness { amount: 0.2 }), 4, 4);
+        stack.add("蓝", 4, 4);
+        stack.layers[3].pixels = RgbaImage::from_pixel(4, 4, image::Rgba([10, 10, 10, 128]));
+        let out = composite(&stack, 4, 4).get_pixel(0, 0).0;
+        // 亮度层下的红灰：100 → 100+51=151；其上半透明蓝(10)50%：
+        // co = 0.5·10 + 0.5·151 = 80.5 → 81（手算）
+        assert_close(out, [81, 81, 81, 255], 1, "调整只作用于其下内容，上层正常混合");
+        let _ = doc;
+    }
+
+    #[test]
+    fn 调整图层_非破坏_像素不动_开关可逆_删除即回原() {
+        let mut doc = doc_two_raster();
+        let (base_id, red_id) = {
+            let ids: Vec<u32> = doc.stack.iter().map(|l| l.id).collect();
+            (ids[0], ids[1])
+        };
+        let before_pixels: Vec<Vec<u8>> = doc
+            .stack
+            .iter()
+            .map(|l| l.pixels.as_raw().clone())
+            .collect();
+        let scene = doc.composite().into_raw();
+
+        // 加色相调整（HSL 色轮红+120°=绿）：下层像素逐字节不变
+        edit_add_adjustment(&mut doc, Adjustment::Hue { degrees: 120.0 }).expect("加调整层");
+        let after_pixels: Vec<Vec<u8>> = doc.stack
+            .iter()
+            .filter(|l| l.kind == LayerKind::Raster)
+            .map(|l| l.pixels.as_raw().clone())
+            .collect();
+        assert_eq!(before_pixels, after_pixels, "调整层不得改动下层像素（非破坏）");
+        let adjusted = doc.composite();
+        assert_close(adjusted.get_pixel(0, 0).0, [0, 255, 0, 255], 1, "红经色相+120°应变绿");
+
+        // 隐藏 → 合成逐字节回到加调整前
+        let adj_id = doc.stack.iter().next_back().unwrap().id;
+        edit_set_layer_visible(&mut doc, adj_id, false).expect("隐藏调整层");
+        assert_eq!(doc.composite().into_raw(), scene, "隐藏调整层应精确回到未调整");
+
+        // 恢复可见、改参数（曲线提亮）→ 合成随之变化
+        edit_set_layer_visible(&mut doc, adj_id, true).unwrap();
+        edit_set_adjustment(
+            &mut doc,
+            adj_id,
+            Adjustment::Curves { points: vec![[0.0, 0.0], [255.0, 255.0], [128.0, 200.0]] },
+        )
+        .expect("改参数");
+        // （normalize 排序后点列为 [(0,0),(128,200),(255,255)]：红(255) → 255 不变，
+        // 此处仅验证改参数不报错且历史前进）
+        assert_eq!(doc.history.info().entries.last().map(String::as_str), Some("曲线参数"));
+
+        // 删除调整层 → 回原；删除层入历史
+        edit_delete_layer(&mut doc, adj_id).expect("删除调整层");
+        assert_eq!(doc.composite().into_raw(), scene, "删除调整层应回到未调整");
+        let (base_id2, red_id2) = (base_id, red_id);
+        assert_eq!(doc.stack.iter().map(|l| l.id).collect::<Vec<_>>(), vec![base_id2, red_id2]);
+    }
+
+    #[test]
+    fn 调整参数_同值不压历史_非调整层拒绝() {
+        let mut doc = doc_two_raster();
+        let adj = Adjustment::Brightness { amount: 0.1 };
+        edit_add_adjustment(&mut doc, adj.clone()).expect("加调整层");
+        let id = doc.stack.iter().next_back().unwrap().id;
+        let history_len = doc.history.info().entries.len();
+        edit_set_adjustment(&mut doc, id, adj.clone()).expect("同值设置");
+        assert_eq!(doc.history.info().entries.len(), history_len, "同值不压历史");
+        // 越界参数归一：amount=5 → 1
+        edit_set_adjustment(&mut doc, id, Adjustment::Brightness { amount: 5.0 }).unwrap();
+        match &doc.stack.iter().find(|l| l.id == id).unwrap().kind {
+            LayerKind::Adjustment(Adjustment::Brightness { amount }) => {
+                assert!((*amount - 1.0).abs() < 1e-6, "amount 应归一到 1.0");
+            }
+            other => panic!("应仍是调整层：{other:?}"),
+        }
+        // 在栅格层上设调整参数 → 拒绝
+        let base = doc.stack.iter().next().unwrap().id;
+        assert!(edit_set_adjustment(&mut doc, base, adj).is_err());
+    }
+
+    #[test]
+    fn 填充_文字与调整图层拒绝() {
+        let mut doc = doc_two_raster();
+        edit_add_adjustment(&mut doc, Adjustment::Hue { degrees: 10.0 }).unwrap();
+        assert!(
+            apply_fill(&mut doc, [0, 0, 0, 255]).is_err(),
+            "调整图层不可直接填充"
+        );
+        assert!(
+            crate::layers::edit_fill(&mut doc, [0, 0, 0, 255]).is_err(),
+            "edit_fill 同样拒绝"
+        );
+    }
+
+    // —— M4 文字图层 ——
+
+    fn have_font() -> bool {
+        if crate::text::default_font_path().is_some() {
+            true
+        } else {
+            eprintln!("跳过：本机无可用系统字体");
+            false
+        }
+    }
+
+    fn sample_spec(text: &str) -> crate::text::TextSpec {
+        crate::text::TextSpec {
+            text: text.into(),
+            family: "黑体".into(),
+            size: 24.0,
+            color: [255, 255, 255, 255],
+            x: 2.0,
+            y: 4.0,
+        }
+    }
+
+    #[test]
+    fn 文字图层_加层编辑与栅格化管线() {
+        if !have_font() { return; }
+        // 64×64 画布：24px 双字都落进画布（8×8 只容得下一角的切片）
+        let mut doc = new_document(64, 64, Some([255, 255, 255, 255])).expect("新建");
+        edit_add_text(&mut doc, sample_spec("墨")).expect("加文字层");
+        let text_id = doc.stack.iter().next_back().unwrap().id;
+        let layer = doc.stack.iter().find(|l| l.id == text_id).unwrap();
+        assert_eq!(layer.name, "文字：墨");
+        assert_eq!(layer.pixels.dimensions(), (64, 64), "文字层像素与文档同尺寸");
+        let covered = layer.pixels.pixels().filter(|p| p.0[3] > 0).count();
+        assert!(covered > 0, "文字应已栅格化（覆盖像素 > 0）");
+        // 合成：文字像素混入结果（取一个被覆盖点，应为白或偏白）
+        assert_eq!(doc.active_layer_id, text_id, "新文字层置顶激活");
+
+        // 编辑内容：改文本 → 重栅格化；同值不压历史
+        let history_before = doc.history.info().entries.len();
+        let mut spec2 = sample_spec("墨笔");
+        spec2.color = [255, 215, 0, 255];
+        edit_set_text(&mut doc, text_id, spec2.clone()).expect("编辑文字");
+        assert_eq!(doc.history.info().entries.len(), history_before + 1, "编辑压一条历史");
+        let layer = doc.stack.iter().find(|l| l.id == text_id).unwrap();
+        match &layer.kind {
+            LayerKind::Text(s) => assert_eq!(s.text, "墨笔"),
+            other => panic!("应仍是文字层：{other:?}"),
+        }
+        let covered2 = layer.pixels.pixels().filter(|p| p.0[3] > 0).count();
+        assert!(covered2 > covered, "两字覆盖应多于一字");
+        edit_set_text(&mut doc, text_id, spec2).expect("同值编辑");
+        assert_eq!(doc.history.info().entries.len(), history_before + 1, "同值不压历史");
+
+        // 非文字层上设文本 → 拒绝
+        let base = doc.stack.iter().next().unwrap().id;
+        assert!(edit_set_text(&mut doc, base, sample_spec("x")).is_err());
+        // 文字层上填色/画笔 → 拒绝（内容以文本参数为准）
+        doc.active_layer_id = text_id;
+        assert!(apply_fill(&mut doc, [0, 0, 0, 255]).is_err(), "文字层不可直接填充");
+    }
+
+    #[test]
+    fn 文字图层_空文本允许_未知族回退不报错() {
+        if !have_font() { return; }
+        let mut doc = doc_two_raster();
+        let mut spec = sample_spec("");
+        spec.family = "不存在的字体".into();
+        edit_add_text(&mut doc, spec).expect("空文本 + 未知族（回退链兜底）应成功");
+        let text_id = doc.stack.iter().next_back().unwrap().id;
+        let layer = doc.stack.iter().find(|l| l.id == text_id).unwrap();
+        assert_eq!(layer.name, "文字", "空文本层名兜底");
+        assert_eq!(layer.pixels.pixels().filter(|p| p.0[3] > 0).count(), 0);
+    }
+
+    #[test]
+    fn 快照_携带图层种类与参数() {
+        let mut doc = doc_two_raster();
+        edit_add_adjustment(&mut doc, Adjustment::Brightness { amount: 0.25 }).unwrap();
+        let snap = snapshot(&doc);
+        let adj_layer = snap.layers.last().unwrap();
+        assert_eq!(adj_layer.name, "亮度调整");
+        match &adj_layer.kind {
+            LayerKindInfo::Adjustment { adjustment } => {
+                assert_eq!(*adjustment, Adjustment::Brightness { amount: 0.25 });
+            }
+            other => panic!("快照应含调整种类：{other:?}"),
+        }
+        match &snap.layers[0].kind {
+            LayerKindInfo::Raster => {}
+            other => panic!("背景层应为栅格：{other:?}"),
+        }
     }
 }

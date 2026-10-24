@@ -628,3 +628,150 @@ body {
   font-size: var(--fang-font-size-xs);
   color: var(--fang-color-text-muted);
 }
+
+/* —— M4：文字工具选项栏字段 —— */
+
+.mo-tool-options__field {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--fang-space-1);
+  color: var(--fang-color-text-muted);
+  white-space: nowrap;
+}
+
+.mo-tool-options__field--grow {
+  flex: 1 1 12em;
+  min-width: 10em;
+}
+
+.mo-tool-options__field span {
+  font-size: var(--fang-font-size-xs);
+}
+
+.mo-tool-options__field select,
+.mo-tool-options__field input[type="number"],
+.mo-tool-options__field input[type="text"] {
+  background: var(--fang-color-bg-overlay);
+  border: 1px solid var(--fang-color-border-strong);
+  border-radius: var(--fang-radius-sm);
+  color: var(--fang-color-text);
+  font-size: var(--fang-font-size-sm);
+  padding: 2px var(--fang-space-1);
+  max-width: 9em;
+}
+
+.mo-tool-options__field--grow input[type="text"] {
+  max-width: none;
+  flex: 1;
+}
+
+.mo-tool-options__field input[type="number"] {
+  width: 4.5em;
+}
+
+.mo-tool-options__field input[type="color"] {
+  width: 24px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--fang-color-border-strong);
+  border-radius: var(--fang-radius-sm);
+  background: none;
+  cursor: pointer;
+}
+
+/* —— M4：图层种类徽标与提示 —— */
+
+.mo-layers__badge {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--fang-color-accent, #5b8def);
+  border-radius: var(--fang-radius-sm);
+  color: var(--fang-color-accent, #5b8def);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.mo-layers__note {
+  margin: var(--fang-space-1) 0 0;
+  font-size: var(--fang-font-size-xs);
+  color: var(--fang-color-text-muted);
+}
+
+/* —— M4：调整面板 —— */
+
+.mo-adjust__empty {
+  margin: 0;
+  padding: var(--fang-space-2);
+  font-size: var(--fang-font-size-xs);
+  color: var(--fang-color-text-muted);
+}
+
+.mo-adjust__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--fang-space-2);
+  padding: var(--fang-space-2);
+}
+
+.mo-adjust__field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--fang-space-1);
+  font-size: var(--fang-font-size-sm);
+}
+
+.mo-adjust__field em {
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+  color: var(--fang-color-text-muted);
+}
+
+.mo-adjust__note {
+  margin: 0;
+  font-size: var(--fang-font-size-xs);
+  color: var(--fang-color-text-muted);
+}
+
+.mo-adjust__curve {
+  width: 100%;
+  max-width: 220px;
+  aspect-ratio: 1;
+  display: block;
+  border: 1px solid var(--fang-color-border-strong);
+  border-radius: var(--fang-radius-sm);
+  background: var(--fang-color-bg-overlay);
+  color: var(--fang-color-border);
+  touch-action: none;
+  cursor: crosshair;
+}
+
+.mo-adjust__grid line {
+  stroke-width: 1;
+}
+
+.mo-adjust__diagonal {
+  stroke: var(--fang-color-border);
+  stroke-dasharray: 4 3;
+  stroke-width: 1;
+}
+
+.mo-adjust__curve-line {
+  fill: none;
+  stroke: var(--fang-color-accent, #5b8def);
+  stroke-width: 2;
+}
+
+.mo-adjust__curve-point {
+  fill: var(--fang-color-bg);
+  stroke: var(--fang-color-accent, #5b8def);
+  stroke-width: 2;
+  cursor: grab;
+}
+
+.mo-adjust__curve-point:active {
+  cursor: grabbing;
+}

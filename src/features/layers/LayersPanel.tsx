@@ -1,9 +1,12 @@
 /**
- * 图层面板（M2，产品分析「右侧停靠面板区」的首块）：列表（上=顶）、可见性、
- * 增删、上下移、活动层的不透明度与混合模式。
+ * 图层面板（M2 起，产品分析「右侧停靠面板区」的首块）：列表（上=顶）、可见性、
+ * 增删、上下移、活动层的不透明度与混合模式；M4 起图层分三种——栅格/调整
+ * （徽标「调」）/文字（徽标「文」），并可一键新建亮度/曲线/色相调整图层。
  *
  * Rust 是事实源：所有操作走 layerPipeline（成功后快照落 store、合成像素重拉）。
  * 展示顺序与栈序相反——栈自底向上，面板自上而下（Photoshop 惯例）。
+ * 调整层不参与混合模式（Rust 合成对调整层忽略之），下拉禁用；不透明度 =
+ * 调整强度（原值与调整值按其线性混合）。
  */
 import { useEffect } from "react";
 import { ArrowDown, ArrowUp, Eye, EyeOff, Plus, Trash2 } from "lucide-react";
@@ -11,9 +14,15 @@ import {
   selectActiveLayers,
   useDocsStore,
 } from "../../core/document/store";
-import { BLEND_MODE_LABELS, type BlendModeName, type LayerMeta } from "../../core/document/types";
+import {
+  ADJUSTMENT_TYPE_LABELS,
+  BLEND_MODE_LABELS,
+  type BlendModeName,
+  type LayerMeta,
+} from "../../core/document/types";
 import {
   activateLayer,
+  addAdjustmentLayer,
   addLayer,
   deleteLayer,
   moveLayer,
@@ -22,6 +31,32 @@ import {
   setLayerOpacity,
   setLayerVisible,
 } from "../../core/document/layerPipeline";
+
+/** 图层行徽标与摘要（按种类）。 */
+function kindBadge(layer: LayerMeta): { badge: string; title: string; summary: string } {
+  if (layer.kind.kind === "adjustment") {
+    const a = layer.kind.adjustment;
+    const summary =
+      a.type === "brightness"
+        ? `${a.amount > 0 ? "+" : ""}${Math.round(a.amount * 100)}`
+        : a.type === "hue"
+          ? `${a.degrees > 0 ? "+" : ""}${a.degrees}°`
+          : `${a.points.length} 点`;
+    return {
+      badge: "调",
+      title: "调整图层（非破坏，只作用于其下内容）",
+      summary: `${ADJUSTMENT_TYPE_LABELS[a.type]} ${summary}`,
+    };
+  }
+  if (layer.kind.kind === "text") {
+    return { badge: "文", title: "文字图层（选项栏编辑内容）", summary: "文字" };
+  }
+  return {
+    badge: "",
+    title: "栅格图层",
+    summary: BLEND_MODE_LABELS.find((m) => m.value === layer.blendMode)?.label ?? "正常",
+  };
+}
 
 export function LayersPanel() {
   const docId = useDocsStore((s) => s.activeId);
@@ -53,6 +88,8 @@ export function LayersPanel() {
   const activeLayer = layers.find((l) => l.id === activeLayerId);
   const activeIndex = layers.findIndex((l) => l.id === activeLayerId);
   const stackLen = layers.length;
+  const activeIsAdjustment = activeLayer?.kind.kind === "adjustment";
+  const activeIsText = activeLayer?.kind.kind === "text";
 
   /** 面板「上移/下移」换算成栈索引（0 = 最底）。 */
   const moveBy = (delta: number) => {
@@ -73,13 +110,15 @@ export function LayersPanel() {
 
   return (
     <div className="mo-layers">
-      {/* 活动层的混合模式与不透明度（Photoshop：面板顶部控制活动层） */}
+      {/* 活动层的混合模式与不透明度（Photoshop：面板顶部控制活动层）。
+          调整层不参与混合模式（合成忽略），禁用以免误导；不透明度=调整强度。 */}
       <div className="mo-layers__controls">
         <label className="mo-layers__field">
           <span>混合模式</span>
           <select
             value={activeLayer?.blendMode ?? "normal"}
-            disabled={!activeLayer}
+            disabled={!activeLayer || activeIsAdjustment}
+            title={activeIsAdjustment ? "调整图层不使用混合模式" : undefined}
             onChange={(e) => {
               if (activeLayer) {
                 run(setLayerBlendMode(docId, activeLayer.id, e.target.value as BlendModeName));
@@ -95,7 +134,8 @@ export function LayersPanel() {
         </label>
         <label className="mo-layers__field">
           <span>
-            不透明度 <em>{activeLayer ? Math.round(activeLayer.opacity * 100) : 0}%</em>
+            {activeIsAdjustment ? "调整强度" : "不透明度"}{" "}
+            <em>{activeLayer ? Math.round(activeLayer.opacity * 100) : 0}%</em>
           </span>
           <input
             type="range"
@@ -113,10 +153,36 @@ export function LayersPanel() {
         </label>
       </div>
 
-      {/* 图层操作按钮排 */}
+      {/* 图层操作按钮排：栅格新建 / 三种调整图层新建 / 删除 / 上下移 */}
       <div className="mo-layers__actions">
         <button type="button" className="mo-layers__btn" title="新建图层" onClick={() => run(addLayer(docId))}>
           <Plus size={14} aria-hidden />
+        </button>
+        <button
+          type="button"
+          className="mo-layers__btn"
+          title="新建亮度调整图层（非破坏）"
+          onClick={() => run(addAdjustmentLayer(docId, { type: "brightness", amount: 0 }))}
+        >
+          亮
+        </button>
+        <button
+          type="button"
+          className="mo-layers__btn"
+          title="新建曲线调整图层（非破坏）"
+          onClick={() =>
+            run(addAdjustmentLayer(docId, { type: "curves", points: [[0, 0], [255, 255]] }))
+          }
+        >
+          曲
+        </button>
+        <button
+          type="button"
+          className="mo-layers__btn"
+          title="新建色相调整图层（非破坏）"
+          onClick={() => run(addAdjustmentLayer(docId, { type: "hue", degrees: 0 }))}
+        >
+          色
         </button>
         <button
           type="button"
@@ -149,35 +215,42 @@ export function LayersPanel() {
 
       {/* 图层列表（上=顶） */}
       <ul className="mo-layers__list">
-        {rows.map((layer) => (
-          <li key={layer.id}>
-            <button
-              type="button"
-              className={`mo-layers__row${layer.id === activeLayerId ? " mo-layers__row--active" : ""}`}
-              onClick={() => run(activateLayer(docId, layer.id))}
-              title={`${layer.name}（点击设为活动图层）`}
-            >
-              <span
-                role="button"
-                tabIndex={-1}
-                className="mo-layers__eye"
-                title={layer.visible ? "隐藏图层" : "显示图层"}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  run(setLayerVisible(docId, layer.id, !layer.visible));
-                }}
+        {rows.map((layer) => {
+          const { badge, title, summary } = kindBadge(layer);
+          return (
+            <li key={layer.id}>
+              <button
+                type="button"
+                className={`mo-layers__row${layer.id === activeLayerId ? " mo-layers__row--active" : ""}`}
+                onClick={() => run(activateLayer(docId, layer.id))}
+                title={`${layer.name}（${title}；点击设为活动图层）`}
               >
-                {layer.visible ? <Eye size={14} aria-hidden /> : <EyeOff size={14} aria-hidden />}
-              </span>
-              <span className="mo-layers__name">{layer.name}</span>
-              <span className="mo-layers__meta">
-                {BLEND_MODE_LABELS.find((m) => m.value === layer.blendMode)?.label}
-                {layer.opacity < 1 ? ` ${Math.round(layer.opacity * 100)}%` : ""}
-              </span>
-            </button>
-          </li>
-        ))}
+                <span
+                  role="button"
+                  tabIndex={-1}
+                  className="mo-layers__eye"
+                  title={layer.visible ? "隐藏图层" : "显示图层"}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    run(setLayerVisible(docId, layer.id, !layer.visible));
+                  }}
+                >
+                  {layer.visible ? <Eye size={14} aria-hidden /> : <EyeOff size={14} aria-hidden />}
+                </span>
+                {badge ? <span className="mo-layers__badge">{badge}</span> : null}
+                <span className="mo-layers__name">{layer.name}</span>
+                <span className="mo-layers__meta">
+                  {summary}
+                  {layer.opacity < 1 ? ` ${Math.round(layer.opacity * 100)}%` : ""}
+                </span>
+              </button>
+            </li>
+          );
+        })}
       </ul>
+      {activeIsText && (
+        <p className="mo-layers__note">文字图层：用文字工具选项栏编辑内容与样式</p>
+      )}
     </div>
   );
 }

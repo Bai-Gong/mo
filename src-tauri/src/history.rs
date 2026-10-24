@@ -7,9 +7,13 @@
 //! - **图层结构**（增删/排序/可见性/不透明度/混合模式/裁剪）：条目持有逆命令
 //!   参数（新建存 id、删除存整层、排序存双下标、属性存前后值、裁剪存整栈快照）。
 //!
+//! M4 追加调整/文字两类条目：调整的增层与改参存**参数前后值**（像素从不落
+//! 盘——非破坏），文字的增层与编辑存**内容参数**并按参数确定性重栅格化。
+//!
 //! 不变量（撤销重做的正确性根基）：条目按 LIFO 消费——撤销到第 k 条时，文档
 //! 状态必然等于「第 k 条刚应用完」的状态，因此逆命令参数在应用时永远有效。
-//! 据此，新建图层的撤销/重做无需存像素（压栈时新层必为空层）。
+//! 据此，新建图层的撤销/重做无需存像素（压栈时新层必为空层）；新建文字层的
+//! 重放按参数重栅格化（字体文件不变则逐字节一致）。
 //!
 //! 选区不进历史（Photoshop 同惯例：选区是会话态不是文档编辑）；裁剪会清空
 //! 选区，撤销裁剪不恢复选区。历史上限 50 条（Photoshop 默认值同量级），
@@ -18,8 +22,10 @@
 use image::RgbaImage;
 use serde::Serialize;
 
+use crate::adjustments::Adjustment;
 use crate::imageio::ImageDocument;
-use crate::layers::{BlendMode, Layer};
+use crate::layers::{rasterize_text_pixels, BlendMode, Layer, LayerKind};
+use crate::text::TextSpec;
 
 /// 历史条目上限（超出丢最旧；Photoshop 默认 20–50 的量级）。
 pub const MAX_ENTRIES: usize = 50;
@@ -104,6 +110,42 @@ pub enum HistoryEntry {
         active_before: u32,
         active_after: u32,
     },
+    /// 新建调整图层（M4）：重放按同 id 置顶重建同参数调整层（像素恒空）。
+    AddAdjustmentLayer {
+        label: String,
+        layer_id: u32,
+        name: String,
+        adjustment: Adjustment,
+        active_before: u32,
+        active_after: u32,
+    },
+    /// 调整参数变更（M4）：参数前后值（非破坏，无像素字节）。
+    AdjustmentParams {
+        label: String,
+        layer_id: u32,
+        before: Adjustment,
+        after: Adjustment,
+        active_before: u32,
+        active_after: u32,
+    },
+    /// 新建文字图层（M4）：内容参数即事实源，重放按参数重栅格化。
+    AddTextLayer {
+        label: String,
+        layer_id: u32,
+        name: String,
+        spec: TextSpec,
+        active_before: u32,
+        active_after: u32,
+    },
+    /// 文字内容编辑（M4）：参数前后值，重放 = 换参数 + 重栅格化。
+    EditText {
+        label: String,
+        layer_id: u32,
+        before: TextSpec,
+        after: TextSpec,
+        active_before: u32,
+        active_after: u32,
+    },
 }
 
 impl HistoryEntry {
@@ -114,7 +156,11 @@ impl HistoryEntry {
             | HistoryEntry::DeleteLayer { label, .. }
             | HistoryEntry::MoveLayer { label, .. }
             | HistoryEntry::LayerProp { label, .. }
-            | HistoryEntry::Crop { label, .. } => label,
+            | HistoryEntry::Crop { label, .. }
+            | HistoryEntry::AddAdjustmentLayer { label, .. }
+            | HistoryEntry::AdjustmentParams { label, .. }
+            | HistoryEntry::AddTextLayer { label, .. }
+            | HistoryEntry::EditText { label, .. } => label,
         }
     }
 }
@@ -208,12 +254,6 @@ pub fn write_region(img: &mut RgbaImage, r: DirtyRect, bytes: &[u8]) {
     }
 }
 
-/// 对一层做矩形裁剪（裁剪命令与 Crop 条目重放共用；纯几何，确定性）。
-fn crop_image(img: &RgbaImage, rect: DirtyRect) -> RgbaImage {
-    let (x, y, w, h) = rect;
-    image::imageops::crop_imm(img, x, y, w, h).to_image()
-}
-
 /// 应用一条历史条目（forward = 正放/重做，false = 倒放/撤销）。
 ///
 /// LIFO 不变量保证：倒放第 k 条时文档恰处于「第 k 条刚应用完」的状态，
@@ -251,6 +291,7 @@ fn apply_entry(doc: &mut ImageDocument, index: usize, forward: bool) {
                     name: name.clone(),
                     // 压栈时新层必为空（LIFO 不变量），重放按当前文档尺寸重建
                     pixels: RgbaImage::new(doc.width, doc.height),
+                    kind: LayerKind::Raster,
                     visible: true,
                     opacity: 1.0,
                     blend_mode: BlendMode::Normal,
@@ -315,7 +356,7 @@ fn apply_entry(doc: &mut ImageDocument, index: usize, forward: bool) {
         } => {
             if forward {
                 for layer in doc.stack.iter_mut() {
-                    layer.pixels = crop_image(&layer.pixels, *rect);
+                    crate::layers::crop_layer(layer, rect.0, rect.1, rect.2, rect.3);
                 }
                 doc.width = rect.2;
                 doc.height = rect.3;
@@ -327,6 +368,84 @@ fn apply_entry(doc: &mut ImageDocument, index: usize, forward: bool) {
             }
             // 裁剪清空选区（选区是会话态，尺寸变了蒙版随之作废）；撤销不恢复
             doc.selection = None;
+            doc.active_layer_id = if forward { *active_after } else { *active_before };
+        }
+        HistoryEntry::AddAdjustmentLayer {
+            layer_id,
+            name,
+            adjustment,
+            active_before,
+            active_after,
+            ..
+        } => {
+            if forward {
+                let layer = Layer {
+                    id: *layer_id,
+                    name: name.clone(),
+                    pixels: RgbaImage::new(0, 0),
+                    kind: LayerKind::Adjustment(adjustment.clone()),
+                    visible: true,
+                    opacity: 1.0,
+                    blend_mode: BlendMode::Normal,
+                };
+                doc.stack.push_layer(layer);
+            } else {
+                doc.stack.remove_by_id(*layer_id);
+            }
+            doc.active_layer_id = if forward { *active_after } else { *active_before };
+        }
+        HistoryEntry::AdjustmentParams {
+            layer_id,
+            before,
+            after,
+            active_before,
+            active_after,
+            ..
+        } => {
+            let target = if forward { after } else { before };
+            if let Some(layer) = doc.stack.iter_mut().find(|l| l.id == *layer_id) {
+                layer.kind = LayerKind::Adjustment(target.clone());
+            }
+            doc.active_layer_id = if forward { *active_after } else { *active_before };
+        }
+        HistoryEntry::AddTextLayer {
+            layer_id,
+            name,
+            spec,
+            active_before,
+            active_after,
+            ..
+        } => {
+            if forward {
+                let pixels = rasterize_text_pixels(spec, doc.width, doc.height);
+                let layer = Layer {
+                    id: *layer_id,
+                    name: name.clone(),
+                    pixels,
+                    kind: LayerKind::Text(spec.clone()),
+                    visible: true,
+                    opacity: 1.0,
+                    blend_mode: BlendMode::Normal,
+                };
+                doc.stack.push_layer(layer);
+            } else {
+                doc.stack.remove_by_id(*layer_id);
+            }
+            doc.active_layer_id = if forward { *active_after } else { *active_before };
+        }
+        HistoryEntry::EditText {
+            layer_id,
+            before,
+            after,
+            active_before,
+            active_after,
+            ..
+        } => {
+            let target = if forward { after } else { before };
+            if let Some(layer) = doc.stack.iter_mut().find(|l| l.id == *layer_id) {
+                layer.kind = LayerKind::Text(target.clone());
+                layer.pixels = rasterize_text_pixels(target, doc.width, doc.height);
+            }
             doc.active_layer_id = if forward { *active_after } else { *active_before };
         }
     }
@@ -548,5 +667,209 @@ mod tests {
         // 全部可撤销回初始（最旧被丢，初始=最早幸存条目之前的状态）
         while undo(&mut doc) {}
         assert_eq!(doc.history.info().index, 0);
+    }
+
+    // —— M4：调整/文字条目的撤销重做 ——
+
+    use crate::adjustments::Adjustment;
+    use crate::layers::{edit_add_adjustment, edit_add_text, edit_set_adjustment, edit_set_text};
+
+    fn have_font() -> bool {
+        if crate::text::default_font_path().is_some() {
+            true
+        } else {
+            eprintln!("跳过：本机无可用系统字体");
+            false
+        }
+    }
+
+    fn spec_of(text: &str) -> crate::text::TextSpec {
+        crate::text::TextSpec {
+            text: text.into(),
+            family: "黑体".into(),
+            size: 16.0,
+            color: [255, 255, 255, 255],
+            x: 1.0,
+            y: 2.0,
+        }
+    }
+
+    #[test]
+    fn 调整条目_增层改参撤销重做_合成精确往返() {
+        let mut doc = doc8();
+        let base = doc.stack.iter().next().unwrap().id;
+        doc.active_layer_id = base;
+        edit_fill(&mut doc, [255, 0, 0, 255]).expect("填红");
+        let filled = doc.composite().into_raw();
+
+        // 增调整层（色相+90 → 绿）→ 撤销回红 → 重做回绿
+        edit_add_adjustment(&mut doc, Adjustment::Hue { degrees: 90.0 }).expect("加调整层");
+        let adj_id = doc.stack.iter().next_back().unwrap().id;
+        let adjusted = doc.composite().into_raw();
+        assert_ne!(adjusted, filled);
+        assert!(undo(&mut doc));
+        assert_eq!(doc.composite().into_raw(), filled, "撤销加调整层应回到原合成");
+        assert!(redo(&mut doc));
+        assert_eq!(doc.composite().into_raw(), adjusted, "重做应精确复现调整后合成");
+
+        // 改参数（→亮度 0.2）→ 撤销回色相 → 重做回亮度
+        edit_set_adjustment(&mut doc, adj_id, Adjustment::Brightness { amount: 0.2 })
+            .expect("改参数");
+        let reparamed = doc.composite().into_raw();
+        assert!(undo(&mut doc));
+        assert_eq!(doc.composite().into_raw(), adjusted, "撤销改参应回到上一参数状态");
+        assert!(redo(&mut doc));
+        assert_eq!(doc.composite().into_raw(), reparamed, "重做改参应精确复现");
+
+        // 与像素条目混排：LIFO 下一路退到底（改参→加层→填充），填红也回退
+        assert!(undo(&mut doc));
+        assert!(undo(&mut doc));
+        assert!(undo(&mut doc));
+        assert_eq!(
+            doc.composite().get_pixel(2, 2).0,
+            [0, 0, 0, 0],
+            "退过填红后背景层回到全透明"
+        );
+    }
+
+    #[test]
+    fn 文字条目_增层编辑撤销重做_像素精确复原() {
+        if !have_font() { return; }
+        let mut doc = doc8();
+        edit_add_text(&mut doc, spec_of("墨")).expect("加文字层");
+        let text_id = doc.stack.iter().next_back().unwrap().id;
+        let added = doc.composite().into_raw();
+        let layer_pixels = pixels_of(&doc, text_id);
+
+        // 撤销加层 → 层消失；重做 → 同 id 回来且像素逐字节一致（重栅格化确定性）
+        assert!(undo(&mut doc));
+        assert_eq!(doc.stack.len(), 1, "撤销加文字层应摘除该层");
+        assert!(redo(&mut doc));
+        assert_eq!(doc.stack.iter().next_back().unwrap().id, text_id, "重做复用原 id");
+        assert_eq!(pixels_of(&doc, text_id), layer_pixels, "重放的文字栅格应逐字节一致");
+        assert_eq!(doc.composite().into_raw(), added);
+
+        // 编辑内容 → 撤销回旧文 → 重做回新文
+        let mut spec2 = spec_of("墨笔");
+        spec2.color = [0, 255, 0, 255];
+        edit_set_text(&mut doc, text_id, spec2).expect("编辑文字");
+        let edited = doc.composite().into_raw();
+        assert_ne!(edited, added, "改文字应改变合成");
+        assert!(undo(&mut doc));
+        assert_eq!(doc.composite().into_raw(), added, "撤销编辑应回到旧文字");
+        assert!(redo(&mut doc));
+        assert_eq!(doc.composite().into_raw(), edited, "重做编辑应精确复现");
+    }
+
+    #[test]
+    fn 裁剪_含调整与文字层_整栈随裁_撤销复原() {
+        if !have_font() { return; }
+        let mut doc = doc8();
+        edit_fill(&mut doc, [255, 255, 255, 255]).expect("填白");
+        edit_add_adjustment(&mut doc, Adjustment::Brightness { amount: 0.1 }).expect("调整层");
+        edit_add_text(&mut doc, spec_of("墨")).expect("文字层");
+        let (adj_id, text_id) = {
+            let ids: Vec<u32> = doc.stack.iter().map(|l| l.id).collect();
+            (ids[1], ids[2])
+        };
+
+        crate::imageio::apply_crop(&mut doc, 2.0, 2.0, 4.0, 4.0).expect("裁剪");
+        assert_eq!((doc.width, doc.height), (4, 4), "文档随裁剪变小");
+        for layer in doc.stack.iter() {
+            assert_eq!(layer.pixels.dimensions(), (4, 4), "每层像素随裁剪（调整层开新空图）");
+        }
+        // 重放确定性：撤销 → 尺寸/层数/文字像素复原
+        assert!(undo(&mut doc));
+        assert_eq!((doc.width, doc.height), (8, 8));
+        assert_eq!(doc.stack.len(), 3);
+        assert!(doc.stack.iter().any(|l| l.id == adj_id));
+        assert!(doc.stack.iter().any(|l| l.id == text_id));
+        let layer = doc.stack.iter().find(|l| l.id == text_id).unwrap();
+        assert!(
+            layer.pixels.pixels().any(|p| p.0[3] > 0),
+            "撤销裁剪后文字层像素应复原"
+        );
+    }
+
+    /// M4 评审修复的回归：裁剪后编辑文字层不得错位/消失——裁剪必须同步平移
+    /// TextSpec 坐标（事实源），后续按新坐标系重栅格化。
+    /// 场景：64×64 放文字（基线 (10,30)）→ 裁到 (8,8) 起 40×40 →
+    /// spec 应平移到 (2,22)；改字号重栅格化后覆盖仍在画布内且位置随移；
+    /// 撤销裁剪 → 坐标回 (10,30)。
+    #[test]
+    fn 裁剪后编辑文字_坐标随裁剪平移_不错位() {
+        if !have_font() { return; }
+        let mut doc = new_document(64, 64, Some([255, 255, 255, 255])).expect("新建");
+        let mut spec = spec_of("墨");
+        spec.size = 20.0;
+        spec.x = 10.0;
+        spec.y = 30.0;
+        edit_add_text(&mut doc, spec.clone()).expect("加文字层");
+        let text_id = doc.stack.iter().next_back().unwrap().id;
+
+        crate::imageio::apply_crop(&mut doc, 8.0, 8.0, 40.0, 40.0).expect("裁剪");
+        assert_eq!((doc.width, doc.height), (40, 40));
+        // 事实源坐标随裁剪平移：(10,30) − (8,8) = (2,22)
+        match &doc.stack.iter().find(|l| l.id == text_id).unwrap().kind {
+            LayerKind::Text(s) => {
+                assert_eq!((s.x, s.y), (2.0, 22.0), "TextSpec 坐标应随裁剪平移");
+            }
+            other => panic!("应仍是文字层：{other:?}"),
+        }
+        // 裁剪出的区域里有文字（像素缓存随裁）
+        let covered_after_crop = doc
+            .stack
+            .iter()
+            .find(|l| l.id == text_id)
+            .unwrap()
+            .pixels
+            .pixels()
+            .filter(|p| p.0[3] > 0)
+            .count();
+        assert!(covered_after_crop > 0, "裁剪后文字像素缓存应仍在画布内");
+
+        // 裁剪后编辑（改字号）→ 按新坐标系重栅格化，覆盖仍在 40×40 画布内
+        let mut bigger = spec;
+        bigger.size = 28.0;
+        bigger.x = 2.0;
+        bigger.y = 22.0;
+        edit_set_text(&mut doc, text_id, bigger).expect("裁剪后改字号");
+        let re_raster = doc
+            .stack
+            .iter()
+            .find(|l| l.id == text_id)
+            .unwrap()
+            .pixels
+            .pixels()
+            .filter(|p| p.0[3] > 0)
+            .count();
+        assert!(
+            re_raster >= covered_after_crop,
+            "按平移后坐标重栅格化的文字应留在画布内（{re_raster} ≥ {covered_after_crop}）"
+        );
+
+        // 撤销两步（编辑文字 → 裁剪）：整栈快照复原，坐标回原值
+        assert!(undo(&mut doc)); // 撤销「编辑文字」：spec 回裁剪后坐标
+        match &doc.stack.iter().find(|l| l.id == text_id).unwrap().kind {
+            LayerKind::Text(s) => {
+                assert_eq!((s.x, s.y), (2.0, 22.0), "撤销编辑应回裁剪后坐标");
+            }
+            other => panic!("应仍是文字层：{other:?}"),
+        }
+        assert!(undo(&mut doc)); // 撤销「裁剪」：快照复原原坐标
+        match &doc.stack.iter().find(|l| l.id == text_id).unwrap().kind {
+            LayerKind::Text(s) => {
+                assert_eq!((s.x, s.y), (10.0, 30.0), "撤销裁剪应复原原坐标");
+            }
+            other => panic!("应仍是文字层：{other:?}"),
+        }
+        // 重做裁剪：坐标再次平移（重放确定性）
+        assert!(redo(&mut doc));
+        match &doc.stack.iter().find(|l| l.id == text_id).unwrap().kind {
+            LayerKind::Text(s) => {
+                assert_eq!((s.x, s.y), (2.0, 22.0), "重做裁剪应再次平移坐标");
+            }
+            other => panic!("应仍是文字层：{other:?}"),
+        }
     }
 }

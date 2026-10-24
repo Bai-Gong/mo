@@ -47,6 +47,10 @@ export interface DocsState {
   tool: Tool;
   /** 笔刷大小（直径 px，画笔/橡皮共用；半径 = size/2 下传 Rust）。 */
   brushSize: number;
+  /** 文字工具：新文本的字体族（font_families 探测结果，默认微软雅黑）。 */
+  textFamily: string;
+  /** 文字工具：新文本的字号（px，钳 4–512，与 Rust 同口径）。 */
+  textSize: number;
   /** 光标所在图像像素坐标（图像外/无文档为 null）。 */
   cursor: { x: number; y: number } | null;
   /** 光标下像素颜色（实时预览）。 */
@@ -83,6 +87,10 @@ export interface DocsState {
   resizeDoc(docId: number, width: number, height: number): void;
   /** 笔刷大小（直径 px，钳到 1–512）。 */
   setBrushSize(size: number): void;
+  /** 文字工具字体族（面板选择）。 */
+  setTextFamily(family: string): void;
+  /** 文字工具字号（钳 4–512，与 Rust 同口径）。 */
+  setTextSize(size: number): void;
   /** 选区回显落位（null = 取消选择）。 */
   setSelectionEcho(docId: number, shape: SelectionShape | null): void;
   /** 合成像素已重拉，画布源缓存应失效。 */
@@ -120,6 +128,8 @@ export const useDocsStore = create<DocsState>()((set, get) => ({
   history: {},
   tool: "hand",
   brushSize: 8,
+  textFamily: "微软雅黑",
+  textSize: 32,
   cursor: null,
   hoverColor: null,
   pickedColor: null,
@@ -269,6 +279,10 @@ export const useDocsStore = create<DocsState>()((set, get) => ({
     }),
 
   setBrushSize: (size) => set({ brushSize: Math.min(512, Math.max(1, Math.round(size))) }),
+
+  setTextFamily: (family) => set({ textFamily: family }),
+
+  setTextSize: (size) => set({ textSize: Math.min(512, Math.max(4, Math.round(size))) }),
 
   setSelectionEcho: (docId, shape) =>
     set((s) => ({ selection: { ...s.selection, [docId]: shape } })),

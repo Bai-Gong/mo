@@ -32,6 +32,8 @@ function resetStore() {
     history: {},
     tool: "hand",
     brushSize: 8,
+    textFamily: "微软雅黑",
+    textSize: 32,
     cursor: null,
     hoverColor: null,
     pickedColor: null,

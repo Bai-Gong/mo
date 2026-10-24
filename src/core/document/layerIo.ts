@@ -8,7 +8,14 @@
  * 原始字节通道）。选区命令与会话态（设活动图层）不进历史，契约不变。
  */
 import { invoke } from "@tauri-apps/api/core";
-import type { HistoryMeta, LayerMeta, BlendModeName, StrokeParams } from "./types";
+import type {
+  AdjustmentSpec,
+  HistoryMeta,
+  LayerMeta,
+  BlendModeName,
+  StrokeParams,
+  TextSpec,
+} from "./types";
 import type { SelectionShape } from "../canvas/selection";
 
 /** Rust LayersSnapshot（serde camelCase）。 */
@@ -51,6 +58,20 @@ export interface LayerIo {
   paintStroke(docId: number, stroke: StrokeParams): Promise<EditResult>;
   /** 裁剪整栈（浮点矩形，Rust 取整到像素边界）。 */
   cropDocument(docId: number, rect: { x: number; y: number; w: number; h: number }): Promise<EditResult>;
+  /** 新建调整图层（置顶激活，非破坏；adjustment 为 tag=type 参数对象）。 */
+  addAdjustmentLayer(docId: number, adjustment: AdjustmentSpec): Promise<EditResult>;
+  /** 改调整图层的参数（即时反映在合成）。 */
+  setAdjustmentParams(
+    docId: number,
+    layerId: number,
+    adjustment: AdjustmentSpec,
+  ): Promise<EditResult>;
+  /** 新建文字图层（内容即时栅格化；字体不可用返回可读错误）。 */
+  addTextLayer(docId: number, spec: TextSpec): Promise<EditResult>;
+  /** 改文字图层内容（文本/字体/字号/颜色/位置，换内容即重栅格化）。 */
+  setTextLayer(docId: number, layerId: number, spec: TextSpec): Promise<EditResult>;
+  /** 本机可用字体族（文字工具下拉选项）。 */
+  fontFamilies(): Promise<string[]>;
   /** 撤销一步（无可撤销时安静返回当前状态）。 */
   undo(docId: number): Promise<EditResult>;
   /** 重做一步。 */
@@ -106,6 +127,21 @@ export const tauriLayerIo: LayerIo = {
   },
   async cropDocument(docId, rect) {
     return invoke<EditResult>("crop_document", { docId, ...rect });
+  },
+  async addAdjustmentLayer(docId, adjustment) {
+    return invoke<EditResult>("add_adjustment_layer", { docId, adjustment });
+  },
+  async setAdjustmentParams(docId, layerId, adjustment) {
+    return invoke<EditResult>("set_adjustment_params", { docId, layerId, adjustment });
+  },
+  async addTextLayer(docId, spec) {
+    return invoke<EditResult>("add_text_layer", { docId, spec });
+  },
+  async setTextLayer(docId, layerId, spec) {
+    return invoke<EditResult>("set_text_layer", { docId, layerId, spec });
+  },
+  async fontFamilies() {
+    return invoke<string[]>("font_families");
   },
   async undo(docId) {
     return invoke<EditResult>("undo", { docId });

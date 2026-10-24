@@ -243,8 +243,9 @@ pub fn apply_crop(doc: &mut ImageDocument, x: f64, y: f64, w: f64, h: f64) -> Re
     let active_before = doc.active_layer_id;
     let rect = (left as u32, top as u32, cw, ch);
     for layer in doc.stack.iter_mut() {
-        layer.pixels = image::imageops::crop_imm(&layer.pixels, rect.0, rect.1, rect.2, rect.3)
-            .to_image();
+        // M4：调整层无像素（按新尺寸开空图）；栅格/文字层裁像素矩形，
+        // 文字层的 TextSpec 坐标随裁剪平移（crop_layer 内处理）
+        crate::layers::crop_layer(layer, rect.0, rect.1, rect.2, rect.3);
     }
     doc.width = cw;
     doc.height = ch;
@@ -1019,5 +1020,241 @@ mod tests {
         assert_eq!(doc.history.info().index, before.index, "整幅裁剪不压历史");
         // 过小矩形报错
         assert!(apply_crop(&mut doc, 4.0, 4.0, 0.2, 0.2).is_err());
+    }
+
+    // —— M4 准入场景：从零构建并导出一张成品宣传图 ——
+    //
+    // 场景编排（全部走产品内核路径，无一步绕过：new_document → apply_selection/
+    // apply_fill 造景 → edit_add_adjustment/edit_set_adjustment 调色 →
+    // edit_add_text/edit_set_text 文字 → 隐藏/删除/重排调整层 → undo →
+    // encode_image_file 导出 → decode_image_file 重开校验）：
+    //
+    //   480×320 宣传图「百工·墨」，自底向上：
+    //     背景    深藏青 (16,24,48)（new_document 背景）
+    //     天空带  矩形 y∈[0,210) 填玉米花蓝 (100,149,237)
+    //     地面带  矩形 y∈[210,320) 填深绿 (24,72,36)
+    //     太阳    椭圆 中心(368,64) r40 填向日葵黄 (255,215,0)
+    //     [调整]  亮度 +0.12
+    //     [调整]  曲线 [(0,0),(96,64),(160,208),(255,255)] 轻对比
+    //     [调整]  色相 +18°
+    //     文字    标题「百工·墨」黑体 56px 白（基线 y=200）
+    //     文字    副题「图层 · 调色 · 文字，非破坏编辑」黑体 22px 白（基线 y=252）
+    //
+    // 产物精确写到 <仓库>/acceptance/m4-宣传图.png（npm run accept:m4 以
+    // --ignored 运行本测试；普通 cargo test 不重写仓库文件）。
+    #[test]
+    #[ignore = "产物写入仓库 acceptance/，由 npm run accept:m4 显式运行"]
+    fn m4_准入_宣传图_从零构建_调整文字导出() {
+        use crate::adjustments::Adjustment;
+        use crate::history::undo as undo_one;
+        use crate::layers::{
+            edit_add_adjustment, edit_add_text, edit_delete_layer, edit_move_layer,
+            edit_set_adjustment, edit_set_layer_visible, edit_set_text,
+        };
+        use crate::text::TextSpec;
+
+        if crate::text::default_font_path().is_none() {
+            panic!("准入机器必须装有系统字体（Windows 开发机恒有；字体候选表见 text.rs）");
+        }
+
+        const W: u32 = 480;
+        const H: u32 = 320;
+        let mut doc = new_document(W, H, Some([16, 24, 48, 255])).expect("从零新建宣传图底稿");
+
+        // —— 造景（与 M2 海报同一条内核路径）——
+        // 天空带
+        apply_selection(&mut doc, SelectionShape::Rect { x: 0.0, y: 0.0, w: W as f64, h: 210.0 });
+        let sky_id = doc.stack.add("天空", W, H);
+        doc.active_layer_id = sky_id;
+        apply_fill(&mut doc, [100, 149, 237, 255]).expect("填天空");
+        // 地面带
+        apply_selection(&mut doc, SelectionShape::Rect { x: 0.0, y: 210.0, w: W as f64, h: 110.0 });
+        let ground_id = doc.stack.add("地面", W, H);
+        doc.active_layer_id = ground_id;
+        apply_fill(&mut doc, [24, 72, 36, 255]).expect("填地面");
+        // 太阳
+        apply_selection(
+            &mut doc,
+            SelectionShape::Ellipse { cx: 368.0, cy: 64.0, rx: 40.0, ry: 40.0 },
+        );
+        let sun_id = doc.stack.add("太阳", W, H);
+        doc.active_layer_id = sun_id;
+        apply_fill(&mut doc, [255, 215, 0, 255]).expect("填太阳");
+        crate::layers::apply_clear_selection(&mut doc);
+
+        // 场景合成基线 + 栅格层像素快照（非破坏对照）
+        let scene = doc.composite().into_raw();
+        let raster_pixels_before: Vec<Vec<u8>> = doc
+            .stack
+            .iter()
+            .map(|l| l.pixels.as_raw().clone())
+            .collect();
+
+        // —— 调整即图层（非破坏）：三条调整层 ——
+        edit_add_adjustment(&mut doc, Adjustment::Brightness { amount: 0.05 })
+            .expect("加亮度调整");
+        // 编辑参数（走改参路径）：先把亮度调到成片值 +0.12
+        let bright_id = doc.stack.iter().next_back().unwrap().id;
+        edit_set_adjustment(&mut doc, bright_id, Adjustment::Brightness { amount: 0.12 })
+            .expect("调亮度参数");
+        edit_add_adjustment(
+            &mut doc,
+            Adjustment::Curves { points: vec![[0.0, 0.0], [96.0, 64.0], [160.0, 208.0], [255.0, 255.0]] },
+        )
+        .expect("加曲线调整");
+        let curves_id = doc.stack.iter().next_back().unwrap().id;
+        edit_add_adjustment(&mut doc, Adjustment::Hue { degrees: 18.0 }).expect("加色相调整");
+        let hue_id = doc.stack.iter().next_back().unwrap().id;
+
+        // 非破坏：加调整/改参后，栅格层像素逐字节不变
+        let raster_pixels_after: Vec<Vec<u8>> = doc
+            .stack
+            .iter()
+            .filter(|l| matches!(l.kind, crate::layers::LayerKind::Raster))
+            .map(|l| l.pixels.as_raw().clone())
+            .collect();
+        assert_eq!(
+            raster_pixels_before, raster_pixels_after,
+            "调整层不得改动任何下层像素（非破坏）"
+        );
+        // 调整生效：合成 ≠ 场景基线
+        let adjusted = doc.composite().into_raw();
+        assert_ne!(adjusted, scene, "三条调整层应改变合成结果");
+        // 开关等价：全部隐藏 → 逐字节回到场景基线
+        for id in [bright_id, curves_id, hue_id] {
+            edit_set_layer_visible(&mut doc, id, false).expect("隐藏调整层");
+        }
+        assert_eq!(doc.composite().into_raw(), scene, "隐藏调整层应精确回到未调整");
+        for id in [bright_id, curves_id, hue_id] {
+            edit_set_layer_visible(&mut doc, id, true).expect("恢复调整层");
+        }
+        // 重排语义：色相层沉到最底 → 只作用于透明累积（无内容在其下），
+        // 合成等价于「色相隐藏」（调整挂图层栈、位置即作用范围）
+        edit_set_layer_visible(&mut doc, hue_id, false).expect("隐藏色相对照");
+        let without_hue = doc.composite().into_raw();
+        edit_set_layer_visible(&mut doc, hue_id, true).expect("恢复色相");
+        edit_move_layer(&mut doc, hue_id, 0).expect("色相沉底");
+        assert_eq!(
+            doc.composite().into_raw(),
+            without_hue,
+            "沉底的调整层作用于空内容，应等价于隐藏"
+        );
+        undo_one(&mut doc); // 撤销排序，色相回位
+        assert_eq!(doc.composite().into_raw(), adjusted, "撤销重排应复原");
+        // 删除 + 撤销：删「曲线」→ 合成变化；undo → 逐字节复原
+        edit_delete_layer(&mut doc, curves_id).expect("删除曲线层");
+        assert_ne!(doc.composite().into_raw(), adjusted, "删除调整层应改变合成");
+        undo_one(&mut doc);
+        assert_eq!(doc.composite().into_raw(), adjusted, "撤销删除应精确复原");
+
+        // —— 文字图层（真实字体栅格化进合成管线）——
+        let title = TextSpec {
+            text: "百工·墨".into(),
+            family: "黑体".into(),
+            size: 56.0,
+            color: [255, 255, 255, 255],
+            x: 142.0,
+            y: 200.0,
+        };
+        edit_add_text(&mut doc, title.clone()).expect("加标题文字层");
+        let subtitle = TextSpec {
+            text: "图层 · 调色 · 文字，非破坏编辑".into(),
+            family: "黑体".into(),
+            size: 22.0,
+            color: [228, 236, 255, 255],
+            x: 106.0,
+            y: 252.0,
+        };
+        edit_add_text(&mut doc, subtitle.clone()).expect("加副题文字层");
+        // 编辑文字：副题换暖白色（走改参路径并留历史）
+        let sub_id = doc.stack.iter().next_back().unwrap().id;
+        let mut subtitle2 = subtitle.clone();
+        subtitle2.color = [255, 244, 214, 255];
+        edit_set_text(&mut doc, sub_id, subtitle2).expect("编辑副题颜色");
+        undo_one(&mut doc); // 撤销编辑 → 回副题原色（也验证文字条目入历史）
+        let subtitle_id = sub_id;
+
+        // 文字确实栅格化：标题层覆盖像素阈值
+        let title_id = doc
+            .stack
+            .iter()
+            .find(|l| matches!(&l.kind, crate::layers::LayerKind::Text(s) if s.text == title.text))
+            .map(|l| l.id)
+            .expect("标题文字层在栈上");
+        let covered = doc
+            .stack
+            .iter()
+            .find(|l| l.id == title_id)
+            .unwrap()
+            .pixels
+            .pixels()
+            .filter(|p| p.0[3] > 0)
+            .count();
+        assert!(covered > 1500, "56px 四字标题应覆盖上千像素，实际 {covered}");
+        let _ = subtitle_id;
+
+        // 历史标签序列含 M4 新条目（排列/删除条目被后续「撤销后新命令」的
+        // 分支截断正常丢弃——其可逆性已由上面合成逐字节断言覆盖）
+        let labels = doc.history.info().entries;
+        for expected in ["新建调整图层", "亮度参数", "新建文字图层", "编辑文字"] {
+            assert!(
+                labels.iter().any(|l| l.contains(expected)),
+                "历史应含「{expected}」条目，实际 {labels:?}"
+            );
+        }
+
+        // —— 导出（真实 PNG 编码）→ 重开（真实解码）——
+        let out_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("acceptance");
+        std::fs::create_dir_all(&out_dir).expect("建 acceptance 目录");
+        let out_path = out_dir.join("m4-宣传图.png");
+        encode_image_file(&doc, &out_path, SaveFormat::Png, 0).expect("导出宣传图 PNG");
+        let reopened = decode_image_file(&out_path).expect("重开导出的宣传图");
+        assert_eq!((reopened.width, reopened.height), (W, H), "导出尺寸必须精确");
+        let out = reopened.composite();
+        // 不透明（背景层全幅不透明，文字/调整不产生透明）
+        assert!(out.pixels().all(|p| p.0[3] == 255), "宣传图应全程不透明");
+        // 天空区域：调整后 ≠ 原料色（调整真实写进导出）
+        let sky_px = out.get_pixel(60, 100).0;
+        assert_ne!(
+            (sky_px[0], sky_px[1], sky_px[2]),
+            (100u8, 149u8, 237u8),
+            "天空应经调色而非原料色"
+        );
+        // 太阳中心存在（黄色系：r>150 且 b<120）
+        let sun_px = out.get_pixel(368, 64).0;
+        assert!(sun_px[0] > 150 && sun_px[2] < 120, "太阳中心应为暖黄系：{sun_px:?}");
+        // 标题文字带：y∈[150,215) x∈[130,360) 存在大量亮像素（白色标题）
+        let bright_count = (150..215)
+            .flat_map(|y| (130..360).map(move |x| (x, y)))
+            .filter(|(x, y)| {
+                let p = out.get_pixel(*x, *y).0;
+                p[0] > 200 && p[1] > 200 && p[2] > 200
+            })
+            .count();
+        assert!(
+            bright_count > 500,
+            "标题文字应留下大量亮像素（3 个实心汉字的笔画核心），实际 {bright_count}"
+        );
+        // 副题文字带同样有覆盖（较暗的淡蓝白）
+        let sub_count = (232..258)
+            .flat_map(|y| (100..380).map(move |x| (x, y)))
+            .filter(|(x, y)| {
+                let p = out.get_pixel(*x, *y).0;
+                p[0] > 180 && p[1] > 180
+            })
+            .count();
+        assert!(sub_count > 200, "副题文字应有覆盖，实际 {sub_count}");
+
+        // 历史一路撤销到底：回到加调整前的场景基线（场景填充走 apply_fill 不入
+        // 历史，与 M2/M3 准入同口径——历史从第一条调整层条目起算）
+        while undo_one(&mut doc) {}
+        assert_eq!(
+            doc.composite().into_raw(),
+            scene,
+            "全历史撤销后应回到加调整前的场景"
+        );
+        assert_eq!(doc.history.info().index, 0);
+
+        assert!(out_path.is_file(), "产物应已落盘：{}", out_path.display());
     }
 }

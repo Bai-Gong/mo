@@ -2,13 +2,16 @@
 // M0 骨架：空窗口外壳 + app_info 命令；M1：图像管线（imageio.rs——打开/像素/另存/关闭，
 // 选型定案见 docs/图像库选型.md）；M2：图层栈与合成（layers.rs）、选区栅格化
 // （selection.rs）；M3：画笔/橡皮/裁剪（paint.rs）与命令式历史栈（history.rs，
-// 撤销重做覆盖图像内容与图层结构两类操作）。
+// 撤销重做覆盖图像内容与图层结构两类操作）；M4：调色与文字（adjustments.rs
+// 亮度/曲线/色相 + text.rs 文字栅格化，调整/文字皆为图层——非破坏、入历史）。
 
+mod adjustments;
 mod history;
 mod imageio;
 mod layers;
 mod paint;
 mod selection;
+mod text;
 
 use serde::Serialize;
 
@@ -57,6 +60,11 @@ pub fn run() {
             layers::select_all,
             layers::deselect,
             layers::fill_active_layer,
+            layers::add_adjustment_layer,
+            layers::set_adjustment_params,
+            layers::add_text_layer,
+            layers::set_text_layer,
+            layers::font_families,
             paint::paint_stroke,
         ])
         .run(tauri::generate_context!())

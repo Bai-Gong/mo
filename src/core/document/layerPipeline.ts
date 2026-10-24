@@ -19,7 +19,7 @@ import {
 } from "./layerIo";
 import { setPixels } from "./pixelStore";
 import { selectActiveDoc, useDocsStore } from "./store";
-import type { BlendModeName, StrokeParams } from "./types";
+import type { BlendModeName, AdjustmentSpec, StrokeParams, TextSpec } from "./types";
 import type { SelectionShape } from "../canvas/selection";
 
 /** 编辑结果落位：图层快照 + 历史快照 + 尺寸校正。 */
@@ -173,6 +173,50 @@ export async function cropDoc(
   io: LayerIo = tauriLayerIo,
 ): Promise<void> {
   applyEdit(docId, await io.cropDocument(docId, rect));
+  await refreshComposite(docId, io);
+}
+
+/** 新建调整图层（改变合成：对下方内容生效，置顶激活）。 */
+export async function addAdjustmentLayer(
+  docId: number,
+  adjustment: AdjustmentSpec,
+  io: LayerIo = tauriLayerIo,
+): Promise<void> {
+  applyEdit(docId, await io.addAdjustmentLayer(docId, adjustment));
+  await refreshComposite(docId, io);
+}
+
+/** 改调整图层参数（改变合成，非破坏）。 */
+export async function setAdjustmentParams(
+  docId: number,
+  layerId: number,
+  adjustment: AdjustmentSpec,
+  io: LayerIo = tauriLayerIo,
+): Promise<void> {
+  applyEdit(docId, await io.setAdjustmentParams(docId, layerId, adjustment));
+  await refreshComposite(docId, io);
+}
+
+/** 新建文字图层（改变合成：内容栅格化进合成管线，置顶激活）。 */
+export async function addTextLayer(
+  docId: number,
+  spec: TextSpec,
+  io: LayerIo = tauriLayerIo,
+): Promise<number> {
+  const result = await io.addTextLayer(docId, spec);
+  applyEdit(docId, result);
+  await refreshComposite(docId, io);
+  return result.layers.activeLayerId;
+}
+
+/** 改文字图层内容（改变合成，重栅格化）。 */
+export async function setTextLayer(
+  docId: number,
+  layerId: number,
+  spec: TextSpec,
+  io: LayerIo = tauriLayerIo,
+): Promise<void> {
+  applyEdit(docId, await io.setTextLayer(docId, layerId, spec));
   await refreshComposite(docId, io);
 }
 

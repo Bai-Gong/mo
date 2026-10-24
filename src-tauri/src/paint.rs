@@ -147,6 +147,7 @@ fn stroke_region(
 /// 文档级笔画入口（命令与测试共用）：画到活动图层并压历史。
 ///
 /// 空点列 / 半径收拢后仍够不着画布 / 覆盖全 0 → 无操作（不压历史条目）。
+/// 仅栅格层可画（M4：文字层内容会被重栅格化覆盖、调整层无像素）。
 pub fn edit_stroke(
     doc: &mut ImageDocument,
     points: &[[f64; 2]],
@@ -167,6 +168,9 @@ pub fn edit_stroke(
         .iter_mut()
         .find(|l| l.id == active)
         .ok_or_else(|| format!("活动图层 {active} 不存在"))?;
+    if !matches!(layer.kind, crate::layers::LayerKind::Raster) {
+        return Err("只能在栅格图层上绘制（文字/调整图层不可直接画）".into());
+    }
     let before = read_region(&layer.pixels, bbox);
     let touched = stroke_region(&mut layer.pixels, doc.selection.as_ref(), bbox, points, radius, color, erase);
     if !touched {

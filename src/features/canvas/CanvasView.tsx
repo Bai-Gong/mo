@@ -28,7 +28,7 @@ import {
   rectFromDrag,
   type SelectionShape,
 } from "../../core/canvas/selection";
-import { commitSelection, cropDoc, deselect, paintStroke } from "../../core/document/layerPipeline";
+import { commitSelection, cropDoc, deselect, paintStroke, addTextLayer } from "../../core/document/layerPipeline";
 import type { Viewport } from "../../core/document/types";
 
 /** docId → 离屏源画布 + 其合成版本（putImageData 一次，版本变才重建）。 */
@@ -419,6 +419,22 @@ export function CanvasView() {
     }).catch(reportError);
   };
 
+  /** 提交文字：点击画布放置一个新文字层（默认「文字」，选项栏编辑内容）。 */
+  const placeText = (pt: { x: number; y: number }) => {
+    const store = useDocsStore.getState();
+    const activeId = store.activeId;
+    if (activeId === null) return;
+    addTextLayer(activeId, {
+      text: "文字",
+      family: store.textFamily,
+      size: store.textSize,
+      color: foregroundColor(),
+      // 基线在字号上升部以下：点击点即视觉文字顶端附近（Photoshop 点击光标感）
+      x: Math.round(pt.x),
+      y: Math.round(pt.y + store.textSize * 0.8),
+    }).catch(reportError);
+  };
+
   /** 提交裁剪：拖框过小按取消处理（不误裁）。 */
   const commitCrop = (draft: MarqueeDraft) => {
     const activeId = useDocsStore.getState().activeId;
@@ -435,7 +451,7 @@ export function CanvasView() {
     ? "grabbing"
     : panning
       ? "grab"
-      : isSelectTool || isPaintTool || tool === "crop" || tool === "eyedropper"
+      : isSelectTool || isPaintTool || tool === "crop" || tool === "eyedropper" || tool === "text"
         ? "crosshair"
         : "default";
 
@@ -472,6 +488,11 @@ export function CanvasView() {
           } else if (e.button === 0 && tool === "eyedropper") {
             const { color } = probe(px, py);
             if (color) useDocsStore.getState().pickColor(color);
+          } else if (e.button === 0 && tool === "text") {
+            // 文字工具：点击放置新文字层（层置顶激活，选项栏接着编辑）
+            const pt = toImagePos(px, py);
+            if (!pt) return;
+            placeText(pt);
           }
         }}
         onPointerMove={(e) => {

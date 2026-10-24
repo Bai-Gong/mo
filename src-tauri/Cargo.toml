@@ -25,6 +25,7 @@ serde = { version = "1", features = ["derive"] }
 # JPEG 解码走内置 zune-jpeg、PNG 编解码走内置 png 0.18.x；内部工作格式 RGBA8。
 # 底层 zune-jpeg/png 未直引——M1 只用 image 层 API，需要块级控制时再按选型文档直达。
 image = "0.25"
+ab_glyph = "0.2.32"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

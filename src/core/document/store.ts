@@ -107,9 +107,13 @@ export function selectActiveView(s: DocsState): Viewport | undefined {
   return s.activeId === null ? undefined : (s.views[s.activeId] ?? undefined);
 }
 
+/** 空态图层稳定引用：selector 空分支若每次返回新 `[]`，zustand v5 经
+ *  useSyncExternalStore 判快照恒变 → 无限重渲染（React #185，启动黑屏）。 */
+const EMPTY_LAYERS: LayerMeta[] = [];
+
 /** 派生：活动文档的图层列表（自底向上）。 */
 export function selectActiveLayers(s: DocsState): LayerMeta[] {
-  return s.activeId === null ? [] : (s.layers[s.activeId] ?? []);
+  return s.activeId === null ? EMPTY_LAYERS : (s.layers[s.activeId] ?? EMPTY_LAYERS);
 }
 
 /** 派生：活动文档的选区回显。 */

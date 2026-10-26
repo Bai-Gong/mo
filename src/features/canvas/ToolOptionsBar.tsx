@@ -9,7 +9,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { Minus, Plus } from "lucide-react";
-import { useDocsStore } from "../../core/document/store";
+import { useDocsStore, selectActiveLayers } from "../../core/document/store";
 import { hexColor, rgbString, type Rgba } from "../../core/canvas/pixelPicker";
 import { setTextLayer } from "../../core/document/layerPipeline";
 import { tauriLayerIo } from "../../core/document/layerIo";
@@ -128,7 +128,7 @@ function useDraftCommit(value: string, onCommit: (v: string) => void) {
 /** 文字工具选项：无活动文字层时设新文本默认值；有则就地编辑该层内容。 */
 function TextOptions({ foreground }: { foreground: Rgba }) {
   const docId = useDocsStore((s) => s.activeId);
-  const layers = useDocsStore((s) => (s.activeId === null ? [] : (s.layers[s.activeId] ?? [])));
+  const layers = useDocsStore(selectActiveLayers);
   const activeLayerId = useDocsStore((s) =>
     s.activeId === null ? 0 : (s.activeLayerId[s.activeId] ?? 0),
   );

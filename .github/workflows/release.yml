@@ -16,7 +16,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # fang 兄弟仓库检出（原因见 ci.yml 同名步骤注释）
+      # fang 兄弟仓库检出（原因见 ci.yml 同名步骤注释）。
+      # 按轨道定 ref：qa/main 发布轨固定消费 fang@main 稳定版——
+      # 用到坊新 API 的代码合并到 qa/main 前，须先把坊对应提交推进到 main。
       - name: 检出 fang（alias 联调的兄弟仓库）
         uses: actions/checkout@v4
         with:

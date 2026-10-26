@@ -25,12 +25,14 @@ jobs:
       - uses: actions/checkout@v4
       # fang 走 alias 联调轨（vite alias + tsconfig paths 指向 ../fang/src），
       # runner 只有本仓库，须把 fang 检出为兄弟目录，否则 tsc 报 Cannot find module '@baigong/fang'。
+      # 按轨道定 ref：develop 门禁轨消费 fang@develop——与本地子模块跟踪 develop 一致，
+      # 墨在 develop 上消费坊未发布的新 API（如 TitleBar）；qa/release 发布轨仍消费 fang@main 稳定版。
       # 仓库私有化或 fang 上 registry 后此步骤移除。
       - name: 检出 fang（alias 联调的兄弟仓库）
         uses: actions/checkout@v4
         with:
           repository: Bai-Gong/fang
-          ref: main
+          ref: develop
           path: fang
       # checkout 只允许工作区内路径，检出到 fang/ 后挪到兄弟目录 ../fang
       - name: fang 挪到兄弟目录
